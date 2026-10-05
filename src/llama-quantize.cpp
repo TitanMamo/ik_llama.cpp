@@ -8,6 +8,10 @@
 
 #include "iqk/iqk_quantize.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include <thread>
 #include <regex>
 #include <mutex>
@@ -241,7 +245,8 @@ static ggml_type change_type_if_necessary(ggml_type new_type, int nx, int ny) {
         new_type == GGML_TYPE_IQ2_S_R4|| new_type == GGML_TYPE_IQ3_S_R4|| new_type == GGML_TYPE_IQ3_KS ||
         new_type == GGML_TYPE_IQ2_KT  || new_type == GGML_TYPE_IQ3_KT  || new_type == GGML_TYPE_IQ4_KT ||
         new_type == GGML_TYPE_IQ5_KS || new_type == GGML_TYPE_IQ5_KS_R4|| new_type == GGML_TYPE_IQ2_KL ||
-        new_type == GGML_TYPE_IQ1_KT) {
+        new_type == GGML_TYPE_IQ1_KT  || new_type == GGML_TYPE_IQ4_KS_R16 || new_type == GGML_TYPE_IQ1_S_R4 ||
+        new_type == GGML_TYPE_IQ1_M_R4) {
         const int blck = ggml_row_blck_size(new_type);
         if (nx % blck != 0) {
             LLAMA_LOG_WARN("\n\n%s : tensor cols %d x %d are not divisible by %d, required for %s", __func__, nx, ny, blck, ggml_type_name(new_type));
@@ -271,7 +276,9 @@ static ggml_type change_type_if_necessary(ggml_type new_type, int nx, int ny) {
             case GGML_TYPE_IQ3_XXS:
             case GGML_TYPE_IQ3_XXS_R4:
             case GGML_TYPE_IQ1_S:
+            case GGML_TYPE_IQ1_S_R4:
             case GGML_TYPE_IQ1_M:
+            case GGML_TYPE_IQ1_M_R4:
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q2_K_R4:
             case GGML_TYPE_IQ2_K:
@@ -289,6 +296,7 @@ static ggml_type change_type_if_necessary(ggml_type new_type, int nx, int ny) {
             case GGML_TYPE_IQ4_KSS:
             case GGML_TYPE_IQ4_KS:
             case GGML_TYPE_IQ4_KS_R4:
+            case GGML_TYPE_IQ4_KS_R16:
             case GGML_TYPE_IQ4_XS_R8:
             case GGML_TYPE_IQ3_KT:
             case GGML_TYPE_IQ4_KT:
@@ -869,7 +877,8 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
         if (working_type != new_type) {
             printf("\n============ Token embeddings cannot be quantized with row-interleaved quants\n");
             printf("---> Changed %s to %s\n", ggml_type_name(new_type), ggml_type_name(working_type));
-            new_type = working_type;
+            new_type = change_type_if_necessary(working_type, tensor->ne[0], tensor->ne[1]);
+            if (new_type != working_type) ++qs.n_fallback;
         }
     }
 
@@ -878,7 +887,8 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
         if (working_type != new_type) {
             printf("\n============ Per-layer Token embeddings cannot be quantized with row-interleaved quants\n");
             printf("---> Changed %s to %s\n", ggml_type_name(new_type), ggml_type_name(working_type));
-            new_type = working_type;
+            new_type = change_type_if_necessary(working_type, tensor->ne[0], tensor->ne[1]);
+            if (new_type != working_type) ++qs.n_fallback;
         }
     }
 
@@ -981,6 +991,17 @@ static llama_ftype repacked_ftype(llama_ftype ftype) {
 static void do_quantize(int nthread, const ggml_tensor * tensor, ggml_type new_type, const float * f32_data, char * new_data,
         const float * imatrix, std::vector<std::thread> & workers, size_t & new_size, int chunk_size_multiplier,
         const llama_model_quantize_params * params) {
+#ifdef GGML_USE_CUDA
+    if (params->cuda_quantize) {
+        new_size = ggml_cuda_quantize(0, new_type, f32_data, new_data, tensor->ne[1], tensor->ne[0], tensor->ne[2], imatrix);
+        if (new_size > 0) {
+            if (!ggml_validate_row_data(new_type, new_data, new_size)) {
+                throw std::runtime_error("quantized data validation failed");
+            }
+            return;
+        }
+    }
+#endif
     if (nthread > 1 && (tensor->ne[2] % nthread == 0 || tensor->ne[2] >= 2*nthread)) {
         std::mutex mutex;
         int counter = 0;
@@ -1202,6 +1223,12 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         LLAMA_LOG_WARN("%s: ignoring --custom-q rules because default type %s is not quantized\n",
                 __func__, ggml_type_name(default_type));
     }
+
+#ifndef GGML_USE_CUDA
+    if (params->cuda_quantize) {
+        LLAMA_LOG_WARN("%s: ignoring --cuda-quantize because this build has no CUDA backend\n", __func__);
+    }
+#endif
 
     int nthread = params->nthread;
 
@@ -1684,13 +1711,14 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 new_type = params->ffn_up_type;
             }
 
-            if (strcmp(tensor->name, "token_embd.weight") == 0) {
+            if (strcmp(tensor->name, "token_embd.weight") == 0 || strcmp(tensor->name, "per_layer_token_embd.weight") == 0) {
                 // token embeddings cannot be quantized with row-interleaved quants
                 auto working_type = interleaved_properties(new_type).first;
                 if (working_type != new_type) {
                     printf("\n============ Token embeddings cannot be quantized with row-interleaved quants\n");
                     printf("---> Changed %s to %s\n", ggml_type_name(new_type), ggml_type_name(working_type));
-                    new_type = working_type;
+                    new_type = change_type_if_necessary(working_type, tensor->ne[0], tensor->ne[1]);
+                    if (new_type != working_type) ++qs.n_fallback;
                 }
             }
 
@@ -1792,7 +1820,8 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             int chunk_size_multiplier = 1;
             auto [working_type, num_rows] = interleaved_properties(new_type);
             if (tensor->ne[1] % num_rows != 0) {
-                new_type = working_type;
+                new_type = change_type_if_necessary(working_type, tensor->ne[0], tensor->ne[1]);
+                if (new_type != working_type) ++qs.n_fallback;
             } else {
                 chunk_size_multiplier = num_rows;
             }

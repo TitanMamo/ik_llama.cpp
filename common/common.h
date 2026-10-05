@@ -80,6 +80,21 @@ struct llama_control_vector_load_info;
 int32_t cpu_get_num_physical_cores();
 int32_t cpu_get_num_math();
 
+// P-cores, one thread per physical core (no E-cores, no SMT siblings)
+std::vector<int32_t> cpu_get_math_cpus();
+
+// E-cores, one per physical core (Intel hybrid)
+std::vector<int32_t> cpu_get_efficiency_cpus();
+
+// explicit affinity, else auto-detected math CPUs
+std::vector<int32_t> cpu_affinity_resolve(const std::vector<int32_t> & cpus, bool auto_detect);
+
+// explicit affinity, else auto-detected E-cores
+std::vector<int32_t> cpu_affinity_resolve_draft(const std::vector<int32_t> & cpus, bool auto_detect);
+
+bool cpu_affinity_parse_mask (const std::string & value, std::vector<int32_t> & cpus);
+bool cpu_affinity_parse_range(const std::string & value, std::vector<int32_t> & cpus);
+
 enum llama_example {
     LLAMA_EXAMPLE_COMMON,
     LLAMA_EXAMPLE_SPECULATIVE,
@@ -253,6 +268,10 @@ struct common_params_speculative {
 
     llama_context_params cparams_dft; // these are the parameters for the draft llama_context
 
+    // draft affinity from --draft-params; empty = inherit the target
+    std::vector<int32_t> cpu_affinity;
+    bool cpu_affinity_configured = false; // a draft affinity was requested
+
     int32_t n_ctx = 0;  // draft context size
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
@@ -264,8 +283,8 @@ struct common_params_speculative {
     bool autotune = false; // automatically optimize speculative params for max tokens/sec
 
     bool has_dft() const {
-        return !model.empty() || !params.empty();
-        //return !mparams_dft.path.empty() || !mparams_dft.hf_repo.empty();
+        // external draft model present only when -md is set
+        return !model.empty();
     }
 
     std::vector<common_speculative_stage_params> get_resolved_stages() const;
@@ -292,6 +311,9 @@ struct gpt_params {
 
     int32_t n_threads             = cpu_get_num_math();
     int32_t n_threads_batch       =      -1; // number of threads to use for batch processing (-1 = use n_threads)
+    std::vector<int32_t> cpu_affinity;       // logical CPU ids to pin worker threads to (empty = no explicit pinning)
+    bool    cpu_affinity_auto     = false;   // pin to hybrid P-cores when cpu_affinity is empty (--cpu-affinity)
+    bool    cpu_affinity_configured = false; // a CPU affinity option was given
     int32_t n_predict             =      -1; // new tokens to predict
     int32_t n_ctx                 =       0; // context size
     int32_t n_batch               =    2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
