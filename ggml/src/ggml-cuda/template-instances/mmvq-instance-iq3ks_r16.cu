@@ -1,11 +1,8 @@
 #include "../iqk_mmvq_templates.cuh"
 
-template<>
-struct ggml_cuda_type_traits<GGML_TYPE_IQ3KS_R16> {
-    static constexpr int qk = 32;   // block = 16 rows x 32 columns
-    static constexpr int qr = 2;
-    static constexpr int qi = 8;    // one lane per block (vdr = 8)
-};
+// The ggml_cuda_type_traits<GGML_TYPE_IQ3KS_R16> specialization lives in
+// common.cuh (qk = 32, qr = 2, qi = 8) so that both the MMVQ and the MMQ
+// translation units see it.
 
 // IQ3KS_R16 (type 354), 4-row-slice shape (Iwan's IQ4_KS_R16 structure):
 // n_interleaved = 4 -> grid = nrows/4; the template passes the band base via

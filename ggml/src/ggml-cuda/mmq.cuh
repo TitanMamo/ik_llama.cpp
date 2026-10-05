@@ -298,18 +298,6 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
     }
 }
 
-// The MMVQ trait of IQ3KS_R16 uses qk = 32 (16 rows x 32 cols per block), which
-// is what the GEMV template needs, while the MMQ machinery works on 256-column
-// chunks. Keep the trait for the GEMV and override the MMQ granularity here.
-template <ggml_type type>
-static constexpr __host__ __device__ int mmq_qk() {
-    if constexpr (type == GGML_TYPE_IQ3KS_R16) {
-        return QK_K;
-    } else {
-        return ggml_cuda_type_traits<type>::qk;
-    }
-}
-
 #define MMQ_TILE_Y_K (WARP_SIZE + WARP_SIZE/QI8_1)
 
 static int mmq_get_granularity_host(const int mmq_x, const int cc) {
@@ -2897,7 +2885,11 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
 }
 
 // IQ3KS_R16 (204 B blocks: 16 rows x 32 cols; band = 16 f32 row scales + n/32 blocks).
-// One MMQ tile covers 256 columns = 8 consecutive 32-column blocks (kbx0*8 + kqsx).
+// One MMQ tile covers 256 columns = 8 consecutive 32-column blocks (kbx0 + kqsx).
+// The block is 32 columns wide, so the MMQ granularity is the real block size and
+// no tail handling is required: the last k-iteration may read up to 7 blocks past
+// the row's block area, but those columns are zero in the (MATRIX_ROW_PADDING-)
+// padded activations, so they contribute nothing to the dot product.
 // Rows are band-interleaved: row i lives in band i/16, band base = x + (i - i%16)*stride
 // (16*stride == the band stride exactly). The smem tile is column-ordered:
 // int (8*kqsx + m) holds columns 32*kqsx + 4m .. +3 (m = 0..7).
@@ -2929,7 +2921,7 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         const int ir = i % 16;
         const char * band = x + (i - ir)*stride;
         const float d = ((const float *)band)[ir];
-        const block_iq3_ks_r16 * bxi = (const block_iq3_ks_r16 *)(band + 64) + kbx0*8 + kqsx;
+        const block_iq3_ks_r16 * bxi = (const block_iq3_ks_r16 *)(band + 64) + kbx0 + kqsx;
 
         const uint32_t q0 = *(const uint32_t *)(bxi->qs + ir*4);
         const uint32_t q1 = *(const uint32_t *)(bxi->qs + 64 + ir*4);
@@ -3941,7 +3933,7 @@ static __device__ void mul_mat_q_process_tile(
     const int & ne00, const int & ne01, const int & stride01, const int & ne10, const int & ne11, const int & stride11, const int & ne0,
     const int & it, const int & jt, const int & kb0_start, const int & kb0_stop) {
 
-    constexpr int              qk         = mmq_qk<type>();
+    constexpr int              qk         = ggml_cuda_type_traits<type>::qk;
     constexpr int              mmq_y      = get_mmq_y_device();
     constexpr load_tiles_mmq_t load_tiles = mmq_type_traits<mmq_x, mmq_y, nwarps, need_check, type>::load_tiles;
 
@@ -4060,7 +4052,7 @@ static __global__ void mul_mat_q(
         return;
     }
 
-    constexpr int qk    = mmq_qk<type>();
+    constexpr int qk    = ggml_cuda_type_traits<type>::qk;
     constexpr int mmq_y = get_mmq_y_device();
 
     // On AMD or old CUDA the performance with stream-k was worse, use conventional tiling instead:
@@ -4125,7 +4117,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
     float * __restrict__ dst, const float * __restrict__ tmp_last_tile, const int ne00, const int ne01, const int ne11, const int ne0, const int block_num_mmq) {
 
     constexpr int     mmq_y           = get_mmq_y_device();
-    constexpr int     qk              = mmq_qk<type>();
+    constexpr int     qk              = ggml_cuda_type_traits<type>::qk;
     constexpr int     blocks_per_iter = MMQ_ITER_K / qk;
     const     int64_t blocks_per_ne00 = (ne00 + qk - 1) / qk;
 
@@ -4290,7 +4282,7 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
 template <ggml_type type, int mmq_x>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     if constexpr (mmq_kt_tail<type>::value) {
-        if (args.ne00 % mmq_qk<type>() != 0) {
+        if (args.ne00 % ggml_cuda_type_traits<type>::qk != 0) {
             launch_mul_mat_q_impl<type, mmq_x, true>(ctx, args, stream);
             return;
         }
