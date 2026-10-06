@@ -3188,7 +3188,7 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
 // qs byte b of a row holds the pairs of columns {b, b+4, ..., b+28} at shifts 0..14;
 // qh byte b bit t is the high bit of column b+4t.
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq3ks_r16(
-    const char * __restrict__ x, int * __restrict__ x_tile, const int & kbx0, const int & i_max, const int & stride) {
+    const char * __restrict__ x, int * __restrict__ x_tile, const int & kbx0, const int & i_max, const int & stride, int blocks_per_ne00) {
 
 #ifdef INT8_MMA_AVAILABLE
     int   * x_qs = (int   *)  x_tile;
@@ -3201,6 +3201,10 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
 
     constexpr int qstep = 8;
     const int kqsx = threadIdx.x % qstep;
+    // The last 256-column chunk can start within 7 blocks of the row end; wrap
+    // the block index instead of reading past the row's block area (the extra
+    // columns are zero in the padded activations, so they contribute nothing).
+    const int block_id = (kbx0 + kqsx) % blocks_per_ne00;
 
 #pragma unroll
     for (int i0 = 0; i0 < mmq_y; i0 += nwarps * WARP_SIZE/qstep) {
@@ -3213,7 +3217,7 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         const int ir = i % 16;
         const char * band = x + (i - ir)*stride;
         const float d = ((const float *)band)[ir];
-        const block_iq3_ks_r16 * bxi = (const block_iq3_ks_r16 *)(band + 64) + kbx0 + kqsx;
+        const block_iq3_ks_r16 * bxi = (const block_iq3_ks_r16 *)(band + 64) + block_id;
 
         const uint32_t q0 = *(const uint32_t *)(bxi->qs + ir*4);
         const uint32_t q1 = *(const uint32_t *)(bxi->qs + 64 + ir*4);

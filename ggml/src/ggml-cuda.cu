@@ -761,16 +761,7 @@ GGML_CALL static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backen
 
     if (ggml_is_quantized(tensor->type)) {
         if (ne0 % MATRIX_ROW_PADDING != 0) {
-            if (tensor->type == GGML_TYPE_IQ3KS_R16) {
-                // 16-row bands with 32-column blocks: the MMQ loads a whole
-                // 8-block (256-column) chunk, so the last band can be read up to
-                // 7 blocks past its block area (those columns are zero in the
-                // padded activations). The generic per-row padding below would
-                // be 16x too small for such blocks.
-                size += 8*sizeof(block_iq3_ks_r16);
-            } else {
-                size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
-            }
+            size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
         }
     }
 
