@@ -1,6 +1,7 @@
 #include "llama-build-context.h"
 #include "llama-hparams.h"
 #include "llama-cparams.h"
+#include "llama-kvarn.h"
 #include "llama-model.h"
 #include "llama-context.h"
 #include "llama-moe-cache.h"
@@ -106,6 +107,8 @@ void llm_build_context::init() {
         lctx.inp_tokens      = nullptr;
         lctx.inp_embd        = nullptr;
         lctx.inp_pos         = nullptr;
+        lctx.inp_kvarn_ids   = nullptr;
+        lctx.inp_kvarn_pos   = nullptr;
         lctx.inp_out_ids     = nullptr;
         lctx.inp_KQ_mask     = nullptr;
         lctx.inp_KQ_mask_swa = nullptr;
@@ -975,6 +978,19 @@ ggml_tensor * llm_build_context::llm_build_inp_embd(
     return inpL;
 }
 
+// KVarN graph-reuse support: remember a stateful KVarN node of the graph being
+// built (store / materialize / attn) under its cache-layer index, so that a
+// reused graph can have the per-call group state patched into its op_params
+// (see llama_context::kvarn_reuse_check_and_patch).
+static void kvarn_register_node(llama_context & lctx, int il, struct ggml_tensor * t) {
+    if (!lctx.cparams.kvarn.enabled || t == nullptr) {
+        return;
+    }
+    if (il >= 0 && il < (int) lctx.kvarn_nodes.size()) {
+        lctx.kvarn_nodes[il].push_back(t);
+    }
+}
+
 void llm_build_context::llm_build_kv_store(
        struct llama_context & lctx,
         struct ggml_context * ctx,
@@ -998,6 +1014,84 @@ void llm_build_context::llm_build_kv_store(
     const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
 
     GGML_ASSERT(kv.size == n_ctx);
+
+    if (cparams.kvarn.enabled) {
+        // structured record store; the Hadamard rotation was already applied by
+        // -khad/-vhad above (the KVarN store never rotates on its own)
+        const int32_t owner  = lctx.kvarn_owner[il];
+        const int32_t sealed = lctx.kvarn_sealed[il];
+        const int32_t stage_groups = kv.kvarn_stage_groups;
+        // 128-wide channel slices for head dims > 128 (D=256: 2, D=512: 4)
+        const int n_slices = n_embd_head_k > 128 ? (int) (n_embd_head_k / 128) : 1;
+        // first group touched by this call, or -1 when the call is sink-only.
+        // Passed to the op so the CUDA dispatch does not have to scan the
+        // device-resident indices tensor (the CPU reference falls back to a
+        // scan when it is -1, but the value is exact here for both).
+        const int32_t pos_first = kv.cells[kv_head].pos;
+        const int32_t g_first_op = pos_first >= LLAMA_KVARN_GROUP ? pos_first / LLAMA_KVARN_GROUP : -1;
+        if (lctx.inp_kvarn_ids == nullptr) {
+            lctx.inp_kvarn_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+            ggml_set_input(lctx.inp_kvarn_ids);
+        }
+        if (k_cur || v_cur) {
+            ggml_tensor * k_q = nullptr;
+            ggml_tensor * v_q = nullptr;
+            if (k_cur) {
+                k_q = (k_cur->ne[0] == n_embd_head_k && k_cur->ne[1] == n_head_kv && k_cur->ne[2] == n_tokens)
+                        ? k_cur : ggml_reshape_3d(ctx, k_cur, n_embd_head_k, n_head_kv, n_tokens);
+            }
+            if (v_cur) {
+                const int64_t n_embd_head_v_s = hparams.n_embd_head_v(il);
+                v_q = (v_cur->ne[0] == n_embd_head_v_s && v_cur->ne[1] == n_head_kv && v_cur->ne[2] == n_tokens)
+                        ? v_cur : ggml_reshape_3d(ctx, v_cur, n_embd_head_v_s, n_head_kv, n_tokens);
+            }
+            if (k_q != nullptr && v_q != nullptr) {
+                // combined K+V store: one node, one launch for both stage writes
+                ggml_tensor * st = ggml_kvarn_store2(ctx, k_q, v_q, lctx.inp_kvarn_ids,
+                        kv.k_stage[il], kv.v_stage[il], kv.k_records[il], kv.v_records[il],
+                        cparams.kvarn.key_bits, cparams.kvarn.value_bits, cparams.kvarn.sinkhorn_iters,
+                        stage_groups, n_slices, owner, sealed, g_first_op, cparams.kvarn.alpha);
+                ggml_build_forward_expand(graph, st);
+                kvarn_register_node(lctx, il, st);
+            } else {
+                // single-sided layer: keep the per-side ops
+                if (k_q != nullptr) {
+                    ggml_tensor * st = ggml_kvarn_store(ctx, k_q, lctx.inp_kvarn_ids, kv.k_stage[il], kv.k_records[il],
+                            cparams.kvarn.key_bits, cparams.kvarn.value_bits, cparams.kvarn.sinkhorn_iters,
+                            /*value=*/false, stage_groups, n_slices, owner, sealed, g_first_op, cparams.kvarn.alpha);
+                    ggml_build_forward_expand(graph, st);
+                    kvarn_register_node(lctx, il, st);
+                }
+                if (v_q != nullptr) {
+                    ggml_tensor * st = ggml_kvarn_store(ctx, v_q, lctx.inp_kvarn_ids, kv.v_stage[il], kv.v_records[il],
+                            cparams.kvarn.key_bits, cparams.kvarn.value_bits, cparams.kvarn.sinkhorn_iters,
+                            /*value=*/true, stage_groups, n_slices, owner, sealed, g_first_op, cparams.kvarn.alpha);
+                    ggml_build_forward_expand(graph, st);
+                    kvarn_register_node(lctx, il, st);
+                }
+            }
+        }
+        // Ring stage: after this call the newest group is `owner` and groups up
+        // to `sealed` live in records. A group is sealed only when a newer group
+        // needs its ring block, so its own queries always see it in F16. This
+        // mirrors the store's eviction rule (seal everything older than the
+        // call's first group, one-call deferral).
+        const int32_t pos_last = kv.cells[kv_head + n_tokens - 1].pos;
+        if (pos_last >= LLAMA_KVARN_GROUP) {
+            // groups touched by this call start at g_first; everything older was
+            // completed in previous calls and is sealed now (one-call deferral).
+            // g_first_op == -1 means the call is sink-only, i.e. g_first == 1.
+            const int32_t g_first = g_first_op >= 1 ? g_first_op : 1;
+            lctx.kvarn_sealed[il] = std::max(lctx.kvarn_sealed[il], g_first - 1);
+            lctx.kvarn_owner[il]  = pos_last / LLAMA_KVARN_GROUP;
+        }
+        if (getenv("IK_KVARN_DEBUG_VERBOSE") != nullptr && il == 0) {
+            fprintf(stderr, "[build] il=0 n_tokens=%d kv_head=%d pos_last=%d -> owner=%d sealed=%d slots=%d\n",
+                    (int) n_tokens, (int) kv_head, (int) pos_last,
+                    (int) lctx.kvarn_owner[il], (int) lctx.kvarn_sealed[il], (int) (stage_groups - 1));
+        }
+        return;
+    }
 
     //struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, kv.k_l[il], n_tokens*n_embd_k_gqa,
     //        (ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa))*kv_head);
@@ -2151,12 +2245,22 @@ static ggml_tensor * llm_build_kqv(
     const int     kv_layer      = kv_il >= 0 ? kv_il : il;
     const int64_t n_ctx         = kv.size;
     const int32_t n_cache_rows  = kv.rows(kv_layer);
+
+    if (cparams.kvarn.enabled && lctx.inp_kvarn_pos == nullptr) {
+        // per-cell positions of the materialized span (filled in llama_set_inputs
+        // from kv_self.cells, so duplicated/padded cells resolve correctly)
+        lctx.inp_kvarn_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
+        ggml_set_input(lctx.inp_kvarn_pos);
+    }
+
     const int64_t n_head        = hparams.n_head(il);
     const int64_t n_head_kv     = hparams.n_head_kv(il);
     const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
     //const int64_t n_embd_k_gqa  = hparams.n_embd_k_gqa(il);
     const int64_t n_embd_head_v = hparams.n_embd_head_v(il);
     const int64_t n_embd_v_gqa  = hparams.n_embd_v_gqa(il);
+    // 128-wide channel slices for head dims > 128 (D=256: 2, D=512: 4)
+    const int     n_slices      = n_embd_head_k > 128 ? (int) (n_embd_head_k / 128) : 1;
 
     struct ggml_tensor * q = ggml_permute(ctx, q_cur, 0, 2, 1, 3);
     cb(q, "q", il);
@@ -2168,16 +2272,50 @@ static ggml_tensor * llm_build_kqv(
                  : lctx.model.hparams.has_kv(il) ? kv.v_l[il]
                  : lctx.model.hparams.swa_layers[il] ? kv.v_l[hparams.n_layer_kv_from_start-2] : kv.v_l[hparams.n_layer_kv_from_start-1];
 
-    GGML_ASSERT(k_cache != nullptr && "k_cache is null in llm_build_kqv");
-    GGML_ASSERT(v_cache != nullptr && "v_cache is null in llm_build_kqv");
+    if (cparams.kvarn.enabled) {
+        // structured cache: the dense F16 mirrors are not allocated
+        GGML_ASSERT(k_cache == nullptr && v_cache == nullptr);
+    } else {
+        GGML_ASSERT(k_cache != nullptr && "k_cache is null in llm_build_kqv");
+        GGML_ASSERT(v_cache != nullptr && "v_cache is null in llm_build_kqv");
+    }
+
+    // P5 (opt-in via IK_KVARN_P5): decode attention directly over the
+    // structured cache, skipping the dense materialize for this layer.
+    const bool kvarn_p5 = cparams.kvarn.enabled && cparams.flash_attn &&
+            getenv("IK_KVARN_P5") != nullptr &&
+            q_cur->ne[2] == 1 && sinks == nullptr && n_swa == 0 &&
+            hparams.f_attn_logit_softcapping == 0.0f &&
+            hparams.f_max_alibi_bias == 0.0f &&
+            kq_mask != nullptr && n_kv <= 8192 &&
+            k_cache_view == nullptr && v_cache_view == nullptr;
+
+    // combined KVarN materialize: K and V spans in one node (v_flat is a
+    // side-effect output written by the same node)
+    struct ggml_tensor * kvarn_v_flat = nullptr;
 
     struct ggml_tensor * k = k_cache_view ? *k_cache_view : nullptr;
-    if (!k) {
-        k = ggml_view_3d(ctx, k_cache,
+    if (!k && !kvarn_p5) {
+        if (cparams.kvarn.enabled) {
+            ggml_tensor * k_flat = ggml_kvarn_materialize2(ctx,
+                    kv.k_records[kv_layer], kv.v_records[kv_layer],
+                    kv.k_stage[kv_layer], kv.v_stage[kv_layer],
+                    lctx.inp_kvarn_pos, (int) n_kv,
+                    cparams.kvarn.key_bits, cparams.kvarn.value_bits,
+                    kv.kvarn_stage_groups, n_slices, lctx.kvarn_sealed[kv_layer],
+                    &kvarn_v_flat);
+            kvarn_register_node(lctx, kv_layer, k_flat);
+            // expose the native cache strides, like the k_cache view below
+            k = ggml_view_3d(ctx, k_flat, n_embd_head_k, n_kv, n_head_kv,
+                    ggml_row_size(k_flat->type, k_flat->ne[0]),
+                    ggml_row_size(k_flat->type, n_embd_head_k), 0);
+        } else {
+            k = ggml_view_3d(ctx, k_cache,
                     n_embd_head_k, n_kv, n_head_kv,
                     ggml_row_size(k_cache->type, n_embd_head_k)*n_head_kv, //n_embd_k_gqa),
                     ggml_row_size(k_cache->type, n_embd_head_k),
                     (size_t) kv_view_offset*ggml_row_size(k_cache->type, n_embd_head_k)*n_head_kv);
+        }
         if (k_cache_view) {
             *k_cache_view = k;
         }
@@ -2213,35 +2351,62 @@ static ggml_tensor * llm_build_kqv(
 
         // split cached v into n_head heads (not transposed)
         struct ggml_tensor * v = v_cache_view ? *v_cache_view : nullptr;
-        if (!v) {
-            v = ggml_view_3d(ctx, v_cache,
-                        n_embd_head_v, n_kv, n_head_kv,
-                        ggml_row_size(v_cache->type, n_embd_v_gqa),
-                        ggml_row_size(v_cache->type, n_embd_head_v),
-                        (size_t) kv_view_offset*ggml_row_size(v_cache->type, n_embd_v_gqa));
+        if (!v && !kvarn_p5) {
+            if (cparams.kvarn.enabled) {
+                ggml_tensor * v_flat = kvarn_v_flat;
+                if (v_flat == nullptr) {
+                    // combined path not built (e.g. the K span came from a cache
+                    // view): fall back to a single-side materialize
+                    v_flat = ggml_kvarn_materialize(ctx, kv.v_records[kv_layer], kv.v_stage[kv_layer], lctx.inp_kvarn_pos,
+                            (int) n_kv, cparams.kvarn.key_bits, cparams.kvarn.value_bits, /*value=*/true,
+                            kv.kvarn_stage_groups, n_slices, lctx.kvarn_sealed[kv_layer]);
+                    kvarn_register_node(lctx, kv_layer, v_flat);
+                }
+                // expose the native cache strides, like the v_cache view below
+                v = ggml_view_3d(ctx, v_flat, n_embd_head_v, n_kv, n_head_kv,
+                        ggml_row_size(v_flat->type, v_flat->ne[0]),
+                        ggml_row_size(v_flat->type, n_embd_head_v), 0);
+            } else {
+                v = ggml_view_3d(ctx, v_cache,
+                            n_embd_head_v, n_kv, n_head_kv,
+                            ggml_row_size(v_cache->type, n_embd_v_gqa),
+                            ggml_row_size(v_cache->type, n_embd_head_v),
+                            (size_t) kv_view_offset*ggml_row_size(v_cache->type, n_embd_v_gqa));
+            }
             if (v_cache_view) {
                 *v_cache_view = v;
             }
             cb(v, "v", il);
         }
 
-        cur = ggml_flash_attn_ext(ctx, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        cb(cur, "fa", il);
-        ggml_flash_attn_ext_add_sinks(cur, sinks);
-        if (n_swa > 0 && !kv.cells_disordered) {
-            ((int32_t *)cur->op_params)[4] = n_swa;
+        if (kvarn_p5) {
+            cur = ggml_kvarn_attn(ctx, q,
+                    kv.k_records[kv_layer], kv.k_stage[kv_layer],
+                    kv.v_records[kv_layer], kv.v_stage[kv_layer],
+                    lctx.inp_kvarn_pos, kq_mask,
+                    (int) n_kv, cparams.kvarn.key_bits, cparams.kvarn.value_bits,
+                    kv.kvarn_stage_groups, n_slices, lctx.kvarn_sealed[kv_layer], kq_scale);
+            kvarn_register_node(lctx, kv_layer, cur);
+            cb(cur, "kvarn_attn", il);
+        } else {
+            cur = ggml_flash_attn_ext(ctx, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                    hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            cb(cur, "fa", il);
+            ggml_flash_attn_ext_add_sinks(cur, sinks);
+            if (n_swa > 0 && !kv.cells_disordered) {
+                ((int32_t *)cur->op_params)[4] = n_swa;
+            }
+
+            // Some models produced NaNs/gibberish when FA is computed with f16 precision on CUDA
+            // For DeepSeek-2, it is perfectly fine with fp16 for PP, but I get gibberish when uding fp16 for TG.
+            // Not sure if it is really a matter of insufficient precision, or I have made a mistake in the fattn-vec-f16 kernel.
+            if (should_use_f32_precision) {
+                ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+            }
+            //ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
         }
 
-        // Some models produced NaNs/gibberish when FA is computed with f16 precision on CUDA
-        // For DeepSeek-2, it is perfectly fine with fp16 for PP, but I get gibberish when uding fp16 for TG.
-        // Not sure if it is really a matter of insufficient precision, or I have made a mistake in the fattn-vec-f16 kernel.
-        if (should_use_f32_precision) {
-            ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
-        }
-        //ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
-
-        if (cparams.v_cache_hadamard) {
+        if (cparams.v_cache_hadamard && getenv("IK_KVARN_NOVHAD") == nullptr) {
             if (int block_size = lctx.model.hadamard_size_v(il); block_size > 0) {
                 cur = ggml_hadamard(ctx, cur, block_size);
                 cb(cur, "fa_h", il);
@@ -2421,7 +2586,7 @@ ggml_tensor * llm_build_context::llm_build_kv(
             cb(q_cur, "Qcur_hadamard", il);
         }
     }
-    if (cparams.v_cache_hadamard && v_cur) {
+    if (cparams.v_cache_hadamard && v_cur && getenv("IK_KVARN_NOVHAD") == nullptr) {
         if (int block_size = lctx.model.hadamard_size_v(il); block_size > 0) {
             v_cur = ggml_hadamard(ctx, v_cur, block_size);
         }
@@ -2874,6 +3039,12 @@ ggml_cgraph * llm_build_context::llama_build_graph(
     llama_token bos = vocab->token_bos();
     llama_token eos = vocab->token_eos();
     bool is_warming_up = lctx.n_eval == 0 && (batch.n_tokens == 1 && (batch.token[0] == ((bos != -1) ? bos : eos)));
+    if (lctx.cparams.kvarn.enabled) {
+        // fresh graph: reset the KVarN stateful-node registry (a reused graph
+        // patches the registry of the graph it replays)
+        lctx.kvarn_nodes.assign(lctx.kvarn_owner.size(), {});
+        lctx.kvarn_graph = nullptr;
+    }
     struct llm_build_context llm(lctx, batch, cb, worst_case, is_warming_up, n_outputs);
 
     llm.init();
@@ -3240,6 +3411,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
     auto tim2 = ggml_time_us();
     printf("%s(...): %d us\n", __func__, int(tim2-tim1));
 #endif
+
+    if (lctx.cparams.kvarn.enabled) {
+        lctx.kvarn_graph = result;
+    }
 
     return result;
 }

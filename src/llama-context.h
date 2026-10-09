@@ -86,6 +86,7 @@ struct llama_kv_cache {
     bool recurrent = false; // with recurrent state models, a cell can hold the state for more than one past token
     bool hybrid    = false;
     bool v_trans   = true;  // the value tensor is transposed
+    bool kvarn     = false; // KVarN structured cache: the dense F16 mirrors (k_l/v_l) are not allocated
 
     // openPangu s_l holds position-strict MoME conv state, not per-sequence recurrent slots: qnext
     // seq ops and generic serialization skip it, the openPangu state layouts carry it instead.
@@ -131,6 +132,15 @@ struct llama_kv_cache {
     std::vector<struct ggml_tensor *> k_l; // per layer
     std::vector<struct ggml_tensor *> v_l;
     std::vector<struct ggml_tensor *> s_l; // per layer recurrent state storage (Qwen3Next)
+
+    // KVarN structured cache (cparams.kvarn.enabled): per-layer 128-token
+    // records (I8) + F16 sink/stage. k_l/v_l stay allocated (v0 mirrors) but
+    // are not consumed by the KVarN read path.
+    std::vector<struct ggml_tensor *> k_records;  // I8 [record_bytes, n_groups*n_head_kv]
+    std::vector<struct ggml_tensor *> v_records;
+    int32_t kvarn_stage_groups = 2;               // ring blocks: 1 sink + slots
+    std::vector<struct ggml_tensor *> k_stage;    // F16 [head_dim, stage_groups*128, n_head_kv]
+    std::vector<struct ggml_tensor *> v_stage;
 
     // Persistent DSA indexer-key cache. One per indexer layer, MQA single head:
     // [indexer_head_size, kv_size]. Stores architecture-specific indexer keys in their
@@ -662,6 +672,8 @@ struct llama_context {
     struct ggml_tensor * inp_engram_gate_mask = nullptr; // F32 [n_batch]: 0 at image tokens (engram gate shut), 1 elsewhere
     struct ggml_tensor * inp_embd;        // F32 [n_embd, n_batch]
     struct ggml_tensor * inp_pos;         // I32 [n_batch]
+    struct ggml_tensor * inp_kvarn_ids;   // I32 [n_tokens] positions for the KVarN store
+    struct ggml_tensor * inp_kvarn_pos;   // I32 [n_kv] 0..n_kv-1 for KVarN materialize
     struct ggml_tensor * inp_out_ids;     // I32 [n_outputs]
     struct ggml_tensor * inp_KQ_mask;     // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_KQ_mask_swa; // F32 [kv_size, n_batch]
@@ -739,11 +751,29 @@ struct llama_context {
     void reset_scheduler();
     bool can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fingerprint, uint64_t model_state_hash);
 
+    // KVarN: patch the per-call group state into the stateful nodes of the
+    // graph being reused and advance the one-call-deferral state, mirroring
+    // llm_build_kv_store. Returns false when the node registry does not match
+    // the graph (the caller then rebuilds instead of reusing).
+    bool kvarn_reuse_check_and_patch(const struct ggml_cgraph * expected_graph, const struct llama_batch & u_batch);
+
     struct CacheCopy {
         ggml_tensor * cpy = nullptr;
         size_t        step = 0;
     };
     std::vector<CacheCopy> cache_copies;
+
+    // KVarN: per-layer newest group staged in the ring, or -1
+    std::vector<int32_t> kvarn_owner;
+    // KVarN: per-layer highest group already sealed into a record
+    std::vector<int32_t> kvarn_sealed;
+    // KVarN graph-reuse support: the stateful nodes (store/materialize/attn) of
+    // the last built graph, registered per layer, so that a reused graph gets
+    // the per-call group state (owner/sealed/g_first) patched before every
+    // replayed execution. kvarn_graph identifies the graph the registry
+    // belongs to; a stale registry fails the patch and forces a rebuild.
+    std::vector<std::vector<struct ggml_tensor *>> kvarn_nodes;
+    const struct ggml_cgraph * kvarn_graph = nullptr;
     // GLM-DSA lightning indexer: the indexer-key cache (kr_l) write is a separate ggml_cpy that
     // the K/V cache_copies fixup does NOT cover. Under graph reuse (FA pads KV to 256, so n_kv
     // stays constant across consecutive decode ubatches and the graph IS reused) its view_offs

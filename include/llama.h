@@ -444,6 +444,40 @@ extern "C" {
         bool swa_compress;     // must match llama_context_params::swa_compress; the fit also assumes that context's n_ubatch
     };
 
+    // KVarN structured KV-cache quantization parameters. When enabled, K/V are
+    // stored as per-head 128-token records (variance-normalized + RTN) with an
+    // F16 sink/staging area instead of the typed cache; the records are
+    // materialized back to F16 for attention. Requires the head-wise Hadamard
+    // rotation (-khad/-vhad), which the store path reuses; the store does NOT
+    // rotate on its own. See src/llama-kvarn.h for the record format helpers.
+    // (plain fields so this header stays C-compatible; the internal parser and
+    // llama_context_default_params zero/initialize them)
+    struct llama_kvarn_params {
+        bool    enabled;        // whether KVarN structured cache is active
+        int32_t key_bits;       // K payload bits (2,3,4,5,6,8)
+        int32_t value_bits;     // V payload bits (2,3,4,5,6,8)
+        int32_t group;          // tokens per record (128)
+        int32_t sinkhorn_iters; // VarN iterations
+        int32_t sink_tokens;    // unquantized sink tokens (128)
+        float   alpha;          // VarN damping exponent (1.0 = reference)
+    };
+
+    // Parse "-ctk/-ctv" style cache type strings ("kvarnN") into KVarN
+    // parameters. A one-sided selection promotes the other side to the same
+    // width. Returns false and sets *error when the selection is not usable.
+    LLAMA_API bool llama_kvarn_params_from_cache_types(
+             struct llama_kvarn_params * params,
+                          const char * cache_type_k,
+                          const char * cache_type_v,
+                          const char ** error);
+
+    // Runtime validation of KVarN parameters against the model head sizes.
+    // Returns nullptr when the configuration is usable, or a static error.
+    LLAMA_API const char * llama_kvarn_validate(
+            const struct llama_kvarn_params * params,
+            int64_t head_dim_k,
+            int64_t head_dim_v);
+
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggerganov/llama.cpp/pull/7544
     struct llama_context_params {
@@ -533,6 +567,10 @@ extern "C" {
         // pinned to cpu_affinity[t % n_cpu_affinity], NULL = no pinning
         const int32_t * cpu_affinity;
         int32_t         n_cpu_affinity;
+
+        // structured KV-cache quantization (KVarN); overrides type_k/type_v when
+        // enabled. Kept last to preserve the layout of the existing fields.
+        struct llama_kvarn_params kvarn;
     };
 
     // model quantization parameters
@@ -1176,6 +1214,22 @@ extern "C" {
     // Negative indices can be used to access logits in reverse order, -1 is the last logit.
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
+
+    // Debug helper for the KVarN pseudo-decode harness (bench_results/kvarn_p0):
+    // quantizes every completed 128-token KV group in place (sink group 0 and
+    // the trailing incomplete group stay F16). The Hadamard rotation is applied
+    // as part of the codec round trip, which is equivalent to running the model
+    // with rotated Q/K/V. `quantized_groups` is an in/out cursor (pass a fresh
+    // counter per context). `enabled=false` makes the call a no-op, so baseline
+    // and quantized phases share the same code path.
+    LLAMA_API void llama_kvarn_debug_quantize(
+            struct llama_context * ctx,
+            float      alpha,
+            int32_t    k_bits,
+            int32_t    v_bits,
+            int32_t    sinkhorn_iters,
+            bool       enabled,
+            uint32_t * quantized_groups);
 
     // Get the argmax token ID for DFlash draft position i without materializing full logits.
     // Returns LLAMA_TOKEN_NULL if argmax is not available (falls back to logits path).

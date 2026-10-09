@@ -42,6 +42,10 @@ struct llama_cparams {
     bool prefetch_experts;
     bool k_cache_hadamard;
     bool v_cache_hadamard;
+    llama_kvarn_params kvarn;
+    // KVarN ring stage: 1 sink block + (kvarn_stage_groups-1) group slots,
+    // sized from n_ubatch so lazy sealing is exact for any batch shape
+    int32_t kvarn_stage_groups = 2;
     bool dsa_indexer_hadamard = true; // apply Walsh-Hadamard rotation to DSA indexer q/k (precision)
     bool dsa = false;                 // enable GLM DSA sparse attention (off by default; opt-in via --dsa)
     bool fused_idx_topk = false;      // enable the fused indexer topk op (set from llama_context_params, where it is on by default)

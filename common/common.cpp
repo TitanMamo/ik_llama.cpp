@@ -4573,6 +4573,24 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
     throw std::runtime_error("Invalid cache type: " + s);
 }
 
+// Resolves -ctk/-ctv into a ggml cache type, intercepting "kvarnN" selections:
+// KVarN replaces the typed cache with records, so the underlying type stays F16.
+static void kvarn_params_from_types(
+        struct llama_kvarn_params & kvarn, const struct gpt_params & params,
+        ggml_type & type_k, ggml_type & type_v) {
+    const char * error = nullptr;
+    if (!llama_kvarn_params_from_cache_types(&kvarn, params.cache_type_k.c_str(), params.cache_type_v.c_str(), &error)) {
+        throw std::runtime_error(error != nullptr ? error : "invalid KVarN cache type");
+    }
+    if (kvarn.enabled) {
+        type_k = GGML_TYPE_F16;
+        type_v = GGML_TYPE_F16;
+    } else {
+        type_k = kv_cache_type_from_str(params.cache_type_k);
+        type_v = kv_cache_type_from_str(params.cache_type_v);
+    }
+}
+
 static std::pair<int, int> get_batch_ubatch(const gpt_params & params) {
     int n_batch = params.n_batch;
     int n_ubatch = params.n_ubatch;
@@ -4610,8 +4628,10 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.fit             = params.fit;
     mparams.fit_margin      = params.fit_margin;
     mparams.worst_graph_tokens = params.worst_graph_tokens;
-    mparams.type_k          = kv_cache_type_from_str(params.cache_type_k);
-    mparams.type_v          = kv_cache_type_from_str(params.cache_type_v);
+    {
+        llama_kvarn_params kvarn;
+        kvarn_params_from_types(kvarn, params, mparams.type_k, mparams.type_v);
+    }
     mparams.idx_type_k      = kv_cache_type_from_str(params.indexer_cache_type_k);
     mparams.type_k_first    = kv_cache_type_from_str(params.type_k_first);
     mparams.type_k_last     = kv_cache_type_from_str(params.type_k_last );
@@ -4743,8 +4763,10 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.mtp               = params.has_mtp || params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
     cparams.mtp_op_type      = MTP_OP_NONE;
 
-    cparams.type_k = kv_cache_type_from_str(params.cache_type_k);
-    cparams.type_v = kv_cache_type_from_str(params.cache_type_v);
+    kvarn_params_from_types(cparams.kvarn, params, cparams.type_k, cparams.type_v);
+    if (cparams.kvarn.enabled && !cparams.flash_attn) {
+        throw std::runtime_error("KVarN cache requires flash attention");
+    }
     cparams.idx_type_k = kv_cache_type_from_str(params.indexer_cache_type_k);
     cparams.type_reduce = ggml_type_from_str(params.reduce_type);
     cparams.type_graph_attn = ggml_type_from_str(params.graph_attn_precision);

@@ -67,6 +67,8 @@ add_library(llama
             llama-delta-net.cpp
             llama-kda.h
             llama-kda.cpp
+            llama-kvarn.h
+            llama-kvarn.cpp
             unicode.h
             unicode.cpp
             unicode-data.cpp
