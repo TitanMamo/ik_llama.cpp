@@ -7420,7 +7420,7 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
 // KVarN debug capture: when KVARN_DUMP_DIR is set, dump the first rows of every
 // layer's KV cache after each graph compute (the dump is overwritten, so the
 // last compute leaves the full context). Read-only; used to collect real K/V
-// tiles for offline analysis (bench_results/kvarn_p0).
+// tiles for offline analysis.
 static void llama_debug_dump_kv_cache(llama_context & lctx, const char * dir) {
     int64_t max_rows = 8192;
     if (const char * rows_env = getenv("KVARN_DUMP_ROWS")) {

@@ -264,7 +264,7 @@ static void kvarn_quantize_tile(
     // reference KVarN (default); alpha=0 collapses to Hadamard-only RTN.
     // Intermediate values balance uniform absolute error (good for
     // high-magnitude tokens) against uniform relative error (token scales);
-    // see bench_results/kvarn_p0/kvarn_ref.py for the measured tradeoff.
+    // see the KVarN P0 evaluation notes for the measured tradeoff.
     if (alpha != 1.0f) {
         for (int64_t r = 0; r < rows; ++r) {
             s_row[r] = std::pow(s_row[r], alpha);

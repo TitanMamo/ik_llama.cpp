@@ -1215,7 +1215,7 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
-    // Debug helper for the KVarN pseudo-decode harness (bench_results/kvarn_p0):
+    // Debug helper for the KVarN pseudo-decode A/B harness (examples/kvarn-eval):
     // quantizes every completed 128-token KV group in place (sink group 0 and
     // the trailing incomplete group stay F16). The Hadamard rotation is applied
     // as part of the codec round trip, which is equivalent to running the model

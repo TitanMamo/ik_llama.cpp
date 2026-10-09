@@ -2,7 +2,7 @@
 //
 // Exercises GGML_OP_KVARN_STORE / GGML_OP_KVARN_MATERIALIZE through the public
 // API. With --dump-dir DIR the raw tensors of one deterministic run are
-// written to disk so bench_results/kvarn_p0/kvarn_ref.py can re-quantize the
+// written to disk so an external numpy cross-check can re-quantize the
 // same input in numpy and cross-check the produced records.
 
 #include "ggml.h"

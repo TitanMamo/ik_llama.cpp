@@ -2,7 +2,7 @@
 
 // KVarN MMA (tensor-core) batched kernels.
 //
-// Design (settled; full notes in bench_results/kvarn_p0/KVARN_CUDA_HANDOFF.md):
+// Design (settled; see the KVarN CUDA design notes):
 //   score(q,t) = k_other[t] * ( sum_d q[d]*k_scale[d]*code(d,t) + C_q )
 //   C_q        = sum_d q[d]*k_zp[d]                     (per-query constant)
 //
