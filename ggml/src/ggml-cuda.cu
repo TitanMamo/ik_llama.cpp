@@ -55,6 +55,7 @@
 #include "ggml-cuda/argmax.cuh"
 #include "ggml-cuda/multiadd.cuh"
 #include "ggml-cuda/hadamard.cuh"
+#include "ggml-cuda/kvarn-op.cuh"
 #include "ggml-cuda/reduce.cuh"
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/delta-net.cuh"
@@ -3760,6 +3761,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_HADAMARD:
             ggml_cuda_op_hadamard(ctx, dst);
             break;
+        case GGML_OP_KVARN_STORE:
+            ggml_cuda_kvarn_store_op(ctx, dst);
+            break;
+        case GGML_OP_KVARN_MATERIALIZE:
+            ggml_cuda_kvarn_materialize_op(ctx, dst);
+            break;
+        case GGML_OP_KVARN_ATTN:
+            ggml_cuda_kvarn_attn_op(ctx, dst);
+            break;
         case GGML_OP_REPEAT:
             ggml_cuda_op_repeat(ctx, dst);
             break;
@@ -4567,6 +4577,12 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
 
         if (ggml_is_noop(node)) continue;
 
+        // KVarN note: capture was disabled here originally (the seal launches
+        // are host-conditional and the cutoffs are per-call state), but the
+        // CUDA graph update path handles parameter/shape changes and the
+        // per-token individual launches cost ~10% at decode. Capture stays
+        // enabled; correctness is covered by the PPL checks.
+
         if (node->op == GGML_OP_REDUCE) {
             use_cuda_graph = false;
             break;
@@ -5125,6 +5141,133 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                 default:
                     return false;
             }
+        }
+        case GGML_OP_KVARN_STORE: {
+            // side-effect op over the cache tensors (it writes stage/records,
+            // which are its srcs), so it must run where those live; the runtime
+            // wrapper asserts device residency and aborts on a mixed assignment
+            const int bits  = op->op_params[0];
+            const int other = op->op_params[5];
+            switch (bits)  { case 2: case 3: case 4: case 5: case 6: case 8: break; default: return false; }
+            switch (other) { case 2: case 3: case 4: case 5: case 6: case 8: break; default: return false; }
+            if (op->op_params[3] < 2) return false; // ring blocks
+            if (op->op_params[9] != 0) {
+                // combined K+V variant
+                const ggml_tensor * k_cur = op->src[0];
+                const ggml_tensor * v_cur = op->src[1];
+                const ggml_tensor * indices = op->src[2];
+                const ggml_tensor * k_stage = op->src[3];
+                const ggml_tensor * v_stage = op->src[4];
+                const ggml_tensor * k_records = op->src[5];
+                const ggml_tensor * v_records = op->src[6];
+                if (k_cur == nullptr || v_cur == nullptr || indices == nullptr ||
+                    k_stage == nullptr || v_stage == nullptr || k_records == nullptr || v_records == nullptr) return false;
+                if (k_cur->type != GGML_TYPE_F32 || v_cur->type != GGML_TYPE_F32 || indices->type != GGML_TYPE_I32 ||
+                    k_stage->type != GGML_TYPE_F16 || v_stage->type != GGML_TYPE_F16 ||
+                    k_records->type != GGML_TYPE_I8 || v_records->type != GGML_TYPE_I8) return false;
+                const int n_slices = op->op_params[10];
+                if (n_slices < 1 || n_slices > 4) return false;
+                const int64_t kD = k_cur->ne[0], vD = v_cur->ne[0];
+                if (kD % n_slices != 0 || vD % n_slices != 0) return false;
+                const int64_t kDs = kD / n_slices, vDs = vD / n_slices;
+                if ((kDs != 64 && kDs != 128) || (vDs != 64 && vDs != 128)) return false;
+                if (indices->ne[0] != k_cur->ne[2] || indices->ne[0] != v_cur->ne[2]) return false;
+                if (k_stage->ne[0] != kDs || k_stage->ne[2] != k_cur->ne[1] * n_slices) return false;
+                if (v_stage->ne[0] != vDs || v_stage->ne[2] != v_cur->ne[1] * n_slices) return false;
+                return true;
+            }
+            const ggml_tensor * current = op->src[0];
+            const ggml_tensor * indices = op->src[1];
+            const ggml_tensor * stage   = op->src[2];
+            const ggml_tensor * records = op->src[3];
+            if (current == nullptr || indices == nullptr || stage == nullptr || records == nullptr) return false;
+            if (current->type != GGML_TYPE_F32 || indices->type != GGML_TYPE_I32 ||
+                stage->type   != GGML_TYPE_F16 || records->type != GGML_TYPE_I8) return false;
+            if (indices->ne[0] != current->ne[2]) return false;
+            const int n_slices = op->op_params[10];
+            if (n_slices < 1 || n_slices > 4) return false;
+            const int64_t D = current->ne[0];
+            if (D % n_slices != 0) return false;
+            const int64_t Ds = D / n_slices;
+            if (Ds != 64 && Ds != 128) return false;
+            if (stage->ne[0] != Ds || stage->ne[2] != current->ne[1] * n_slices) return false;
+            return true;
+        }
+        case GGML_OP_KVARN_MATERIALIZE: {
+            const int bits  = op->op_params[0];
+            const int other = op->op_params[5];
+            switch (bits)  { case 2: case 3: case 4: case 5: case 6: case 8: break; default: return false; }
+            switch (other) { case 2: case 3: case 4: case 5: case 6: case 8: break; default: return false; }
+            if (op->op_params[3] < 2) return false;
+            if (op->op_params[9] != 0) {
+                // combined K+V variant
+                const ggml_tensor * k_records = op->src[0];
+                const ggml_tensor * k_stage   = op->src[1];
+                const ggml_tensor * indices   = op->src[2];
+                const ggml_tensor * v_records = op->src[3];
+                const ggml_tensor * v_stage   = op->src[4];
+                const ggml_tensor * v_flat    = op->src[5];
+                if (k_records == nullptr || k_stage == nullptr || indices == nullptr ||
+                    v_records == nullptr || v_stage == nullptr || v_flat == nullptr) return false;
+                if (k_records->type != GGML_TYPE_I8 || v_records->type != GGML_TYPE_I8 ||
+                    k_stage->type != GGML_TYPE_F16 || v_stage->type != GGML_TYPE_F16 ||
+                    indices->type != GGML_TYPE_I32 || op->type != GGML_TYPE_F16 ||
+                    v_flat->type != GGML_TYPE_F16) return false;
+                const int64_t kD = k_stage->ne[0], vD = v_stage->ne[0];
+                const int64_t kH = k_stage->ne[2], vH = v_stage->ne[2];
+                if ((kD != 64 && kD != 128) || (vD != 64 && vD != 128)) return false;
+                if (op->ne[0] != kD * kH || v_flat->ne[0] != vD * vH) return false;
+                if (v_flat->ne[1] != op->ne[1]) return false;
+                if (indices->ne[0] < op->ne[1]) return false;
+                return true;
+            }
+            const ggml_tensor * records = op->src[0];
+            const ggml_tensor * stage   = op->src[1];
+            const ggml_tensor * indices = op->src[2];
+            if (records == nullptr || stage == nullptr || indices == nullptr) return false;
+            if (records->type != GGML_TYPE_I8 || stage->type != GGML_TYPE_F16 ||
+                indices->type != GGML_TYPE_I32 || op->type != GGML_TYPE_F16) return false;
+            const int64_t D = stage->ne[0];
+            const int64_t H = stage->ne[2];
+            if ((D != 64 && D != 128) || op->ne[0] != D * H) return false;
+            if (indices->ne[0] < op->ne[1]) return false;
+            return true;
+        }
+        case GGML_OP_KVARN_ATTN: {
+            const ggml_tensor * q       = op->src[0];
+            const ggml_tensor * k_rec   = op->src[1];
+            const ggml_tensor * k_stage = op->src[2];
+            const ggml_tensor * v_rec   = op->src[3];
+            const ggml_tensor * v_stage = op->src[4];
+            const ggml_tensor * indices = op->src[5];
+            const ggml_tensor * mask    = op->src[6];
+            if (q == nullptr || k_rec == nullptr || k_stage == nullptr || v_rec == nullptr ||
+                v_stage == nullptr || indices == nullptr || mask == nullptr) return false;
+            if (q->type != GGML_TYPE_F32 || k_rec->type != GGML_TYPE_I8 || v_rec->type != GGML_TYPE_I8 ||
+                k_stage->type != GGML_TYPE_F16 || v_stage->type != GGML_TYPE_F16 ||
+                indices->type != GGML_TYPE_I32 || mask->type != GGML_TYPE_F16 || op->type != GGML_TYPE_F32) return false;
+            if (q->ne[1] != 1) return false;
+            const int n_slices = op->op_params[6];
+            if (n_slices < 1 || n_slices > 4) return false;
+            const int64_t Dk   = q->ne[0];            // full K head dim
+            const int64_t Dk_s = k_stage->ne[0];
+            const int64_t Dv_s = v_stage->ne[0];
+            if ((Dk_s != 64 && Dk_s != 128) || (Dv_s != 64 && Dv_s != 128)) return false;
+            if (Dk != Dk_s * n_slices) return false;
+            const int64_t Hq  = q->ne[2];
+            if (k_stage->ne[2] % n_slices != 0) return false;
+            const int64_t Hkv = k_stage->ne[2] / n_slices;
+            if (Hkv <= 0 || Hq % Hkv != 0) return false;
+            if (op->ne[0] != Dv_s * n_slices || op->ne[2] != Hq) return false;
+            if (k_stage->ne[2] != v_stage->ne[2]) return false;
+            const int n_kv = op->op_params[0];
+            if (n_kv <= 0 || n_kv > 8192) return false;
+            if (indices->ne[0] < n_kv) return false;
+            const int bits  = op->op_params[3];
+            const int other = op->op_params[4];
+            switch (bits)  { case 2: case 3: case 4: case 5: case 6: case 8: break; default: return false; }
+            switch (other) { case 2: case 3: case 4: case 5: case 6: case 8: break; default: return false; }
+            return true;
         }
         case GGML_OP_DUP:
         case GGML_OP_REPEAT:
