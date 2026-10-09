@@ -727,6 +727,10 @@ extern "C" {
         GGML_OP_LATENT_ATTN,
         GGML_OP_DS4_COMP,
 
+        GGML_OP_KVARN_STORE,
+        GGML_OP_KVARN_MATERIALIZE,
+        GGML_OP_KVARN_ATTN,
+
         GGML_OP_COUNT,
     };
 
@@ -1159,6 +1163,182 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   n);
+
+    // KVarN structured KV-cache quantization. Records span full 128-token
+    // groups, so this deliberately remains separate from ggml_type.
+    //
+    // One record (one group, one KV head) is laid out as
+    //
+    //   [ K payload | k_s_col[D] | k_zp[D] | k_s_row[G] |
+    //     V payload | v_s_col[D] | v_s_row[G] | v_zp[G] ]
+    //
+    // matching the reference KVarN cache layout (KVarNConfig), with all side
+    // metadata F16 (v_s_col is the raw per-channel VarN scale; v_s_row/v_zp
+    // are the absorbed per-token scale/zero point).
+    // Dequantization:
+    //   K[r,c] = (code * k_s_col[r] + k_zp[r]) * k_s_row[c]   tile [D, G]
+    //   V[r,c] = (code * v_s_row[r] + v_zp[r]) * v_s_col[c]   tile [G, D]
+    // r = channel / c = token for K, r = token / c = channel for V. The row
+    // VarN scale is absorbed into the RTN scale and zero point; the remaining
+    // VarN axis is stored raw. The head-wise Hadamard rotation is expected to
+    // be applied elsewhere (see -khad/-vhad), so records hold rotated values.
+    struct ggml_kvarn_layout {
+        int32_t group;
+        int32_t head_dim;
+
+        size_t k_payload_off;
+        size_t k_payload_bytes;
+        size_t k_scale_off; // F16 x head_dim: absorbed per-channel scale
+        size_t k_zp_off;    // F16 x head_dim: absorbed per-channel zero point
+        size_t k_other_off; // F16 x group:     raw per-token VarN scale
+
+        size_t v_payload_off;
+        size_t v_payload_bytes;
+        size_t v_scale_off; // F16 x group:     absorbed per-token scale
+        size_t v_zp_off;    // F16 x group:     absorbed per-token zero point
+        size_t v_other_off; // F16 x head_dim:  raw per-channel VarN scale
+
+        size_t record_bytes; // 8-byte aligned total
+    };
+
+    GGML_API struct ggml_kvarn_layout ggml_kvarn_layout_make(
+            int64_t head_dim,
+            int64_t group,
+            int64_t k_bits,
+            int64_t v_bits);
+
+    // Host-side helpers for offline analysis and debug hooks: normalized
+    // Sylvester Walsh-Hadamard transform (self-inverse, n a power of two) and
+    // one tile through the KVarN quantize/dequantize round trip. The rotation
+    // is applied by the caller, exactly as -khad/-vhad would in the graph.
+    GGML_API void ggml_kvarn_wht(float * values, int64_t n);
+    GGML_API void ggml_kvarn_roundtrip_tile(
+            const float * tile_in,
+            int64_t       rows,
+            int64_t       cols,
+            int           bits,
+            int           sinkhorn_iters,
+            float         alpha,
+            bool          value,
+            float       * tile_out);
+
+    // Writes `current` rows into the F16 `stage` and seals completed 128-token
+    // groups into `records`. Positions < 128 are the permanent sink (stage
+    // block 0); the currently incomplete group lives in stage block 1.
+    //   current     : F32 [head_dim, n_head_kv, n_tokens]
+    //   indices     : I32 [n_tokens]  absolute positions (ascending, contiguous)
+    //   stage       : F16 [head_slice_dim, stage_groups*128, n_head_kv*n_slices]
+    //   records     : I8  [record_bytes, n_groups*n_head_kv*n_slices]
+    // Head dimensions > 128 are stored as n_slices = head_dim/128 independent
+    // 128-wide channel slices (head-slice index hs = h*n_slices + s, used for
+    // both the stage and the records).
+    //   owner_group : newest group being staged into the ring, or -1
+    //   g_first     : first group touched by this call (>= 1), or -1 when the
+    //                 call is sink-only / unknown (the CPU reference then scans
+    //                 `indices`). The CUDA dispatch cannot scan a device
+    //                 tensor, so its caller must pass the value.
+    //   alpha       : experimental VarN damping exponent in [0, 1]; stored
+    //                 scales are s**alpha. 1.0 is the reference KVarN and the
+    //                 default; lower values trade token-scale fidelity for
+    //                 attention-output accuracy on static proxies.
+    GGML_API struct ggml_tensor * ggml_kvarn_store(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * current,
+            struct ggml_tensor  * indices,
+            struct ggml_tensor  * stage,
+            struct ggml_tensor  * records,
+            int                   k_bits,
+            int                   v_bits,
+            int                   sinkhorn_iters,
+            bool                  value,
+            int                   stage_groups, // ring blocks: 1 sink + (stage_groups-1) group slots
+            int                   n_slices,     // 128-wide channel slices per head (1, 2, 4)
+            int                   owner_group,   // newest group being staged, or -1
+            int                   sealed_group,  // highest group already written to a record
+            int                   g_first,       // first group of this call, or -1
+            float                 alpha);
+
+    // Reconstructs a dense F16 tensor [head_dim*n_head_kv, n_kv] (native cache
+    // layout: cells are rows) from records and staging, to be viewed as
+    // [head_dim, n_kv, n_head_kv] exactly like the F16 cache and consumed by
+    // an ordinary attention implementation.
+    GGML_API struct ggml_tensor * ggml_kvarn_materialize(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * records,
+            struct ggml_tensor  * stage,
+            struct ggml_tensor  * indices,
+            int                   n_kv,
+            int                   k_bits,
+            int                   v_bits,
+            bool                  value,
+            int                   stage_groups,
+            int                   n_slices,
+            int                   sealed_group);
+
+    // Combined K+V variants: one graph node per layer (and one launch per
+    // kernel on the CUDA backend) handles both sides. The store2 writes both
+    // sides' stages/records; materialize2 returns the K span as its dst and
+    // the V span through `v_flat_out`, which the same node writes as a
+    // side-effect output (the attention must consume it in a node that runs
+    // after this one, which holds for the KV attention).
+    GGML_API struct ggml_tensor * ggml_kvarn_store2(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k_cur,
+            struct ggml_tensor  * v_cur,
+            struct ggml_tensor  * indices,
+            struct ggml_tensor  * k_stage,
+            struct ggml_tensor  * v_stage,
+            struct ggml_tensor  * k_records,
+            struct ggml_tensor  * v_records,
+            int                   k_bits,
+            int                   v_bits,
+            int                   sinkhorn_iters,
+            int                   stage_groups,
+            int                   n_slices,
+            int                   owner_group,
+            int                   sealed_group,
+            int                   g_first,
+            float                 alpha);
+
+    GGML_API struct ggml_tensor * ggml_kvarn_materialize2(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k_records,
+            struct ggml_tensor  * v_records,
+            struct ggml_tensor  * k_stage,
+            struct ggml_tensor  * v_stage,
+            struct ggml_tensor  * indices,
+            int                   n_kv,
+            int                   k_bits,
+            int                   v_bits,
+            int                   stage_groups,
+            int                   n_slices,
+            int                   sealed_group,
+            struct ggml_tensor ** v_flat_out);
+
+    // KVarN decode attention (P5): computes attention for one query token
+    // directly from the structured cache (records + F16 ring stage), without
+    // materializing a dense K/V span. dst is F32 [head_dim_v, 1, n_head].
+    //   q       : F32 [head_dim_k, 1, n_head]  (rotated Q, like the FA input)
+    //   mask    : F16 [n_kv, 1]                (0 / -inf)
+    //   kq_scale: softmax scale (the FA's kq_scale)
+    // v1 constraints (the caller gates them): single query token, no attention
+    // sinks, no SWA, no logit softcap, no ALiBi bias, n_kv <= 8192.
+    GGML_API struct ggml_tensor * ggml_kvarn_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k_records,
+            struct ggml_tensor  * k_stage,
+            struct ggml_tensor  * v_records,
+            struct ggml_tensor  * v_stage,
+            struct ggml_tensor  * indices,
+            struct ggml_tensor  * mask,
+            int                   n_kv,
+            int                   k_bits,
+            int                   v_bits,
+            int                   stage_groups,
+            int                   n_slices,
+            int                   sealed_group,
+            float                 kq_scale);
 
     // dst = a
     // view(dst, nb1, nb2, nb3, offset) += b

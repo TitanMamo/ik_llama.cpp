@@ -13,6 +13,7 @@
 #include "ggml.h"
 #include "ggml-aarch64.h"
 #include "ggml-moe-prefetch.h"
+#include "ggml-kvarn.h"
 #include "iqk/iqk_quantize.h"
 #include "iqk/iqk_cpu_ops.h"
 #if GGML_USE_IQK_MULMAT
@@ -4674,9 +4675,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MASK_TO_IDX",
     "LATENT_ATTN",
     "DS4_COMP",
+
+    "KVARN_STORE",
+    "KVARN_MATERIALIZE",
+    "KVARN_ATTN",
 };
 
-static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
+static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -4803,10 +4808,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "mask_to_idx(masl)",
     "latent_attn_prefix(q,c,pk,pv,mask)",
     "ds4_comp(state, score, idx)",
+    "kvarn_store(current,indices,stage,records)",
+    "kvarn_materialize(records,stage,indices)",
+    "kvarn_attn(q,kr,ks,vr,vs,indices,mask)",
 
 };
 
-static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
+static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6671,6 +6679,296 @@ struct ggml_tensor * ggml_hadamard(
     result->src[0] = a;
 
     result->op_params[0] = n;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_kvarn_store(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * current,
+        struct ggml_tensor  * indices,
+        struct ggml_tensor  * stage,
+        struct ggml_tensor  * records,
+        int                   k_bits,
+        int                   v_bits,
+        int                   sinkhorn_iters,
+        bool                  value,
+        int                   stage_groups,
+        int                   n_slices,
+        int                   owner_group,
+        int                   sealed_group,
+        int                   g_first,
+        float                 alpha) {
+
+    GGML_ASSERT(current->type == GGML_TYPE_F32);
+    GGML_ASSERT(indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(stage->type   == GGML_TYPE_F16);
+    GGML_ASSERT(records->type == GGML_TYPE_I8);
+    GGML_ASSERT(k_bits >= 2 && k_bits <= 8);
+    GGML_ASSERT(v_bits >= 2 && v_bits <= 8);
+    GGML_ASSERT(sinkhorn_iters > 0);
+    GGML_ASSERT(stage_groups >= 2);
+    GGML_ASSERT(n_slices >= 1 && n_slices <= 4);
+    GGML_ASSERT(alpha >= 0.0f && alpha <= 1.0f);
+    GGML_ASSERT(indices->ne[0] == current->ne[2]);
+    GGML_ASSERT(stage->ne[0]   == (current->ne[0] < 128 ? current->ne[0] : 128));
+    GGML_ASSERT(current->ne[0] == stage->ne[0] * n_slices);
+    GGML_ASSERT(stage->ne[2]   == current->ne[1] * n_slices);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+
+    result->op     = GGML_OP_KVARN_STORE;
+    result->src[0] = current;
+    result->src[1] = indices;
+    result->src[2] = stage;
+    result->src[3] = records;
+
+    result->op_params[0] = value ? v_bits : k_bits;
+    result->op_params[1] = sinkhorn_iters;
+    result->op_params[2] = value ? 1 : 0;
+    result->op_params[3] = stage_groups;
+    result->op_params[4] = owner_group;
+    result->op_params[5] = value ? k_bits : v_bits;
+    memcpy(&result->op_params[6], &alpha, sizeof(float));
+    result->op_params[7] = sealed_group;
+    result->op_params[8] = g_first;
+    result->op_params[10] = n_slices;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_kvarn_materialize(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * records,
+        struct ggml_tensor  * stage,
+        struct ggml_tensor  * indices,
+        int                   n_kv,
+        int                   k_bits,
+        int                   v_bits,
+        bool                  value,
+        int                   stage_groups,
+        int                   n_slices,
+        int                   sealed_group) {
+
+    GGML_ASSERT(records->type == GGML_TYPE_I8);
+    GGML_ASSERT(stage->type   == GGML_TYPE_F16);
+    GGML_ASSERT(indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(k_bits >= 2 && k_bits <= 8);
+    GGML_ASSERT(v_bits >= 2 && v_bits <= 8);
+    GGML_ASSERT(stage_groups >= 2);
+    GGML_ASSERT(n_slices >= 1 && n_slices <= 4);
+    GGML_ASSERT(stage->ne[2] % n_slices == 0);
+    GGML_ASSERT(n_kv > 0 && indices->ne[0] >= n_kv);
+
+    // native cache layout: one row per cell = [head0 head_dim | head1 ... ]
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, stage->ne[0] * stage->ne[2], n_kv);
+
+    result->op     = GGML_OP_KVARN_MATERIALIZE;
+    result->src[0] = records;
+    result->src[1] = stage;
+    result->src[2] = indices;
+
+    result->op_params[0] = value ? v_bits : k_bits;
+    result->op_params[1] = 0;
+    result->op_params[2] = value ? 1 : 0;
+    result->op_params[3] = stage_groups;
+    result->op_params[4] = 0; // unused (store keeps the owner group here)
+    result->op_params[5] = value ? k_bits : v_bits;
+    result->op_params[7] = sealed_group; // same slot as the store
+    result->op_params[10] = n_slices;
+
+    return result;
+}
+
+// Combined K+V store: one node writes both sides' stages and records.
+struct ggml_tensor * ggml_kvarn_store2(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k_cur,
+        struct ggml_tensor  * v_cur,
+        struct ggml_tensor  * indices,
+        struct ggml_tensor  * k_stage,
+        struct ggml_tensor  * v_stage,
+        struct ggml_tensor  * k_records,
+        struct ggml_tensor  * v_records,
+        int                   k_bits,
+        int                   v_bits,
+        int                   sinkhorn_iters,
+        int                   stage_groups,
+        int                   n_slices,
+        int                   owner_group,
+        int                   sealed_group,
+        int                   g_first,
+        float                 alpha) {
+    GGML_ASSERT(k_cur != NULL || v_cur != NULL);
+    GGML_ASSERT(indices != NULL && indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(k_bits >= 2 && k_bits <= 8);
+    GGML_ASSERT(v_bits >= 2 && v_bits <= 8);
+    GGML_ASSERT(sinkhorn_iters > 0);
+    GGML_ASSERT(stage_groups >= 2);
+    GGML_ASSERT(n_slices >= 1 && n_slices <= 4);
+    GGML_ASSERT(alpha >= 0.0f && alpha <= 1.0f);
+    if (k_cur) {
+        GGML_ASSERT(k_cur->type == GGML_TYPE_F32);
+        GGML_ASSERT(k_stage && k_stage->type == GGML_TYPE_F16 && k_records && k_records->type == GGML_TYPE_I8);
+        GGML_ASSERT(indices->ne[0] == k_cur->ne[2]);
+        GGML_ASSERT(k_stage->ne[0] == (k_cur->ne[0] < 128 ? k_cur->ne[0] : 128));
+        GGML_ASSERT(k_cur->ne[0] == k_stage->ne[0] * n_slices);
+        GGML_ASSERT(k_stage->ne[2] == k_cur->ne[1] * n_slices);
+    } else {
+        GGML_ASSERT(k_stage == NULL && k_records == NULL);
+    }
+    if (v_cur) {
+        GGML_ASSERT(v_cur->type == GGML_TYPE_F32);
+        GGML_ASSERT(v_stage && v_stage->type == GGML_TYPE_F16 && v_records && v_records->type == GGML_TYPE_I8);
+        GGML_ASSERT(indices->ne[0] == v_cur->ne[2]);
+        GGML_ASSERT(v_stage->ne[0] == (v_cur->ne[0] < 128 ? v_cur->ne[0] : 128));
+        GGML_ASSERT(v_cur->ne[0] == v_stage->ne[0] * n_slices);
+        GGML_ASSERT(v_stage->ne[2] == v_cur->ne[1] * n_slices);
+    } else {
+        GGML_ASSERT(v_stage == NULL && v_records == NULL);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+
+    result->op     = GGML_OP_KVARN_STORE;
+    result->src[0] = k_cur;
+    result->src[1] = v_cur;
+    result->src[2] = indices;
+    result->src[3] = k_stage;
+    result->src[4] = v_stage;
+    result->src[5] = k_records;
+    result->src[6] = v_records;
+
+    result->op_params[0] = k_bits;
+    result->op_params[1] = sinkhorn_iters;
+    result->op_params[2] = 0;
+    result->op_params[3] = stage_groups;
+    result->op_params[4] = owner_group;
+    result->op_params[5] = v_bits;
+    memcpy(&result->op_params[6], &alpha, sizeof(float));
+    result->op_params[7] = sealed_group;
+    result->op_params[8] = g_first;
+    result->op_params[9] = 1; // combined
+    result->op_params[10] = n_slices;
+
+    return result;
+}
+
+// Combined K+V materialize: dst is the K span, v_flat_out the V span (written
+// by the same node as a side-effect output).
+struct ggml_tensor * ggml_kvarn_materialize2(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k_records,
+        struct ggml_tensor  * v_records,
+        struct ggml_tensor  * k_stage,
+        struct ggml_tensor  * v_stage,
+        struct ggml_tensor  * indices,
+        int                   n_kv,
+        int                   k_bits,
+        int                   v_bits,
+        int                   stage_groups,
+        int                   n_slices,
+        int                   sealed_group,
+        struct ggml_tensor ** v_flat_out) {
+    GGML_ASSERT(k_records && k_records->type == GGML_TYPE_I8);
+    GGML_ASSERT(v_records && v_records->type == GGML_TYPE_I8);
+    GGML_ASSERT(k_stage && k_stage->type == GGML_TYPE_F16);
+    GGML_ASSERT(v_stage && v_stage->type == GGML_TYPE_F16);
+    GGML_ASSERT(indices && indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(k_bits >= 2 && k_bits <= 8);
+    GGML_ASSERT(v_bits >= 2 && v_bits <= 8);
+    GGML_ASSERT(stage_groups >= 2);
+    GGML_ASSERT(n_slices >= 1 && n_slices <= 4);
+    GGML_ASSERT(k_stage->ne[2] % n_slices == 0 && v_stage->ne[2] % n_slices == 0);
+    GGML_ASSERT(n_kv > 0 && indices->ne[0] >= n_kv);
+    GGML_ASSERT(v_flat_out != NULL);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k_stage->ne[0] * k_stage->ne[2], n_kv);
+    struct ggml_tensor * v_flat = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, v_stage->ne[0] * v_stage->ne[2], n_kv);
+    ggml_set_name(v_flat, "kvarn_v_flat");
+    ggml_set_name(result, "kvarn_k_flat");
+
+    result->op     = GGML_OP_KVARN_MATERIALIZE;
+    result->src[0] = k_records;
+    result->src[1] = k_stage;
+    result->src[2] = indices;
+    result->src[3] = v_records;
+    result->src[4] = v_stage;
+    result->src[5] = v_flat;
+
+    result->op_params[0] = k_bits;
+    result->op_params[1] = 0;
+    result->op_params[2] = 0;
+    result->op_params[3] = stage_groups;
+    result->op_params[4] = 0;
+    result->op_params[5] = v_bits;
+    result->op_params[7] = sealed_group;
+    result->op_params[9] = 1; // combined
+    result->op_params[10] = n_slices;
+
+    *v_flat_out = v_flat;
+    return result;
+}
+
+// KVarN decode attention over the structured cache (records + ring stage),
+// without materializing a dense K/V span. v1: one query token, no sinks/SWA/
+// softcap, dense contiguous positions (the caller gates these conditions).
+// op_params: [0]=n_kv [1]=sealed [2]=stage_groups [3]=k_bits [4]=v_bits
+//            [5]=kq_scale (float bits) [6]=n_slices
+struct ggml_tensor * ggml_kvarn_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k_records,
+        struct ggml_tensor  * k_stage,
+        struct ggml_tensor  * v_records,
+        struct ggml_tensor  * v_stage,
+        struct ggml_tensor  * indices,
+        struct ggml_tensor  * mask,
+        int                   n_kv,
+        int                   k_bits,
+        int                   v_bits,
+        int                   stage_groups,
+        int                   n_slices,
+        int                   sealed,
+        float                 kq_scale) {
+    GGML_ASSERT(q && q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_records && k_records->type == GGML_TYPE_I8);
+    GGML_ASSERT(v_records && v_records->type == GGML_TYPE_I8);
+    GGML_ASSERT(k_stage && k_stage->type == GGML_TYPE_F16);
+    GGML_ASSERT(v_stage && v_stage->type == GGML_TYPE_F16);
+    GGML_ASSERT(indices && indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask && mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(k_bits >= 2 && k_bits <= 8);
+    GGML_ASSERT(v_bits >= 2 && v_bits <= 8);
+    GGML_ASSERT(stage_groups >= 2);
+    GGML_ASSERT(n_slices >= 1 && n_slices <= 4);
+    GGML_ASSERT(n_kv > 0 && indices->ne[0] >= n_kv);
+    GGML_ASSERT(q->ne[1] == 1); // v1: one query token
+    GGML_ASSERT(k_stage->ne[0] == (q->ne[0] < 128 ? q->ne[0] : 128));
+    GGML_ASSERT(q->ne[0] == k_stage->ne[0] * n_slices);
+    GGML_ASSERT(k_stage->ne[2] == v_stage->ne[2]);
+    GGML_ASSERT(k_stage->ne[2] % n_slices == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
+            v_stage->ne[0] * n_slices, q->ne[1], q->ne[2]);
+    ggml_set_name(result, "kvarn_attn");
+
+    result->op     = GGML_OP_KVARN_ATTN;
+    result->src[0] = q;
+    result->src[1] = k_records;
+    result->src[2] = k_stage;
+    result->src[3] = v_records;
+    result->src[4] = v_stage;
+    result->src[5] = indices;
+    result->src[6] = mask;
+
+    result->op_params[0] = n_kv;
+    result->op_params[1] = sealed;
+    result->op_params[2] = stage_groups;
+    result->op_params[3] = k_bits;
+    result->op_params[4] = v_bits;
+    memcpy(&result->op_params[5], &kq_scale, sizeof(float));
+    result->op_params[6] = n_slices;
 
     return result;
 }
@@ -26931,6 +27229,18 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             {
                 iqk_hadamard(tensor, params->ith, params->nth);
             } break;
+        case GGML_OP_KVARN_STORE:
+            {
+                ggml_kvarn_compute_store(tensor, params->ith, params->nth);
+            } break;
+        case GGML_OP_KVARN_MATERIALIZE:
+            {
+                ggml_kvarn_compute_materialize(tensor, params->ith, params->nth);
+            } break;
+        case GGML_OP_KVARN_ATTN:
+            {
+                ggml_kvarn_compute_attn(tensor, params->ith, params->nth);
+            } break;
         case GGML_OP_ACC:
             {
                 ggml_compute_forward_acc(params, tensor);
@@ -27883,6 +28193,15 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
         case GGML_OP_HADAMARD:
             {
                 GGML_ABORT("fatal error"); // TODO: implement
+            }
+        case GGML_OP_KVARN_STORE:
+            {
+                GGML_ABORT("fatal error"); // inference-only op
+            }
+        case GGML_OP_KVARN_MATERIALIZE:
+        case GGML_OP_KVARN_ATTN:
+            {
+                GGML_ABORT("fatal error"); // inference-only op
             }
         case GGML_OP_CONCAT:
             {
@@ -29086,6 +29405,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MULTI_ADD:
         case GGML_OP_MUL_MULTI_ADD:
         case GGML_OP_HADAMARD:
+        case GGML_OP_KVARN_STORE:
+        case GGML_OP_KVARN_MATERIALIZE:
+        case GGML_OP_KVARN_ATTN:
         case GGML_OP_REPEAT:
         case GGML_OP_SUB:
             {
