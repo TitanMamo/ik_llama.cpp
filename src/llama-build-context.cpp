@@ -109,6 +109,7 @@ void llm_build_context::init() {
         lctx.inp_pos         = nullptr;
         lctx.inp_kvarn_ids   = nullptr;
         lctx.inp_kvarn_pos   = nullptr;
+        lctx.inp_kvarn_state = nullptr;
         lctx.inp_out_ids     = nullptr;
         lctx.inp_KQ_mask     = nullptr;
         lctx.inp_KQ_mask_swa = nullptr;
@@ -1033,6 +1034,14 @@ void llm_build_context::llm_build_kv_store(
             lctx.inp_kvarn_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
             ggml_set_input(lctx.inp_kvarn_ids);
         }
+        if (lctx.inp_kvarn_state == nullptr) {
+            // ONE shared device-state tensor for all layers (the ops carry their
+            // layer index as an op param and index state + 3*layer). Per-layer
+            // views would make the scheduler treat each view as a separate CPU
+            // graph input and create a per-layer copy (64-input split cap!).
+            lctx.inp_kvarn_state = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 3 * (int64_t) lctx.kvarn_owner.size());
+            ggml_set_input(lctx.inp_kvarn_state);
+        }
         if (k_cur || v_cur) {
             ggml_tensor * k_q = nullptr;
             ggml_tensor * v_q = nullptr;
@@ -1050,7 +1059,8 @@ void llm_build_context::llm_build_kv_store(
                 ggml_tensor * st = ggml_kvarn_store2(ctx, k_q, v_q, lctx.inp_kvarn_ids,
                         kv.k_stage[il], kv.v_stage[il], kv.k_records[il], kv.v_records[il],
                         cparams.kvarn.key_bits, cparams.kvarn.value_bits, cparams.kvarn.sinkhorn_iters,
-                        stage_groups, n_slices, owner, sealed, g_first_op, cparams.kvarn.alpha);
+                        stage_groups, n_slices, owner, sealed, g_first_op, cparams.kvarn.alpha, il,
+                        lctx.inp_kvarn_state);
                 ggml_build_forward_expand(graph, st);
                 kvarn_register_node(lctx, il, st);
             } else {
@@ -1058,14 +1068,16 @@ void llm_build_context::llm_build_kv_store(
                 if (k_q != nullptr) {
                     ggml_tensor * st = ggml_kvarn_store(ctx, k_q, lctx.inp_kvarn_ids, kv.k_stage[il], kv.k_records[il],
                             cparams.kvarn.key_bits, cparams.kvarn.value_bits, cparams.kvarn.sinkhorn_iters,
-                            /*value=*/false, stage_groups, n_slices, owner, sealed, g_first_op, cparams.kvarn.alpha);
+                            /*value=*/false, stage_groups, n_slices, owner, sealed, g_first_op, cparams.kvarn.alpha,
+                            il, lctx.inp_kvarn_state);
                     ggml_build_forward_expand(graph, st);
                     kvarn_register_node(lctx, il, st);
                 }
                 if (v_q != nullptr) {
                     ggml_tensor * st = ggml_kvarn_store(ctx, v_q, lctx.inp_kvarn_ids, kv.v_stage[il], kv.v_records[il],
                             cparams.kvarn.key_bits, cparams.kvarn.value_bits, cparams.kvarn.sinkhorn_iters,
-                            /*value=*/true, stage_groups, n_slices, owner, sealed, g_first_op, cparams.kvarn.alpha);
+                            /*value=*/true, stage_groups, n_slices, owner, sealed, g_first_op, cparams.kvarn.alpha,
+                            il, lctx.inp_kvarn_state);
                     ggml_build_forward_expand(graph, st);
                     kvarn_register_node(lctx, il, st);
                 }
@@ -1085,6 +1097,11 @@ void llm_build_context::llm_build_kv_store(
             lctx.kvarn_sealed[il] = std::max(lctx.kvarn_sealed[il], g_first - 1);
             lctx.kvarn_owner[il]  = pos_last / LLAMA_KVARN_GROUP;
         }
+        // device-side per-call state: cutoffs the CUDA kernels read at
+        // execution time (captured CUDA graphs replay with fresh values)
+        lctx.kvarn_state_fill[3*il + 0] = g_first_op;                    // store: first group of this call
+        lctx.kvarn_state_fill[3*il + 1] = sealed;                        // store: seal lower bound
+        lctx.kvarn_state_fill[3*il + 2] = lctx.kvarn_sealed[il];         // materialize/attn: seal cutoff
         if (getenv("IK_KVARN_DEBUG_VERBOSE") != nullptr && il == 0) {
             fprintf(stderr, "[build] il=0 n_tokens=%d kv_head=%d pos_last=%d -> owner=%d sealed=%d slots=%d\n",
                     (int) n_tokens, (int) kv_head, (int) pos_last,
@@ -2303,7 +2320,7 @@ static ggml_tensor * llm_build_kqv(
                     lctx.inp_kvarn_pos, (int) n_kv,
                     cparams.kvarn.key_bits, cparams.kvarn.value_bits,
                     kv.kvarn_stage_groups, n_slices, lctx.kvarn_sealed[kv_layer],
-                    &kvarn_v_flat);
+                    &kvarn_v_flat, kv_layer, lctx.inp_kvarn_state);
             kvarn_register_node(lctx, kv_layer, k_flat);
             // expose the native cache strides, like the k_cache view below
             k = ggml_view_3d(ctx, k_flat, n_embd_head_k, n_kv, n_head_kv,
@@ -2359,7 +2376,7 @@ static ggml_tensor * llm_build_kqv(
                     // view): fall back to a single-side materialize
                     v_flat = ggml_kvarn_materialize(ctx, kv.v_records[kv_layer], kv.v_stage[kv_layer], lctx.inp_kvarn_pos,
                             (int) n_kv, cparams.kvarn.key_bits, cparams.kvarn.value_bits, /*value=*/true,
-                            kv.kvarn_stage_groups, n_slices, lctx.kvarn_sealed[kv_layer]);
+                            kv.kvarn_stage_groups, n_slices, lctx.kvarn_sealed[kv_layer], kv_layer, lctx.inp_kvarn_state);
                     kvarn_register_node(lctx, kv_layer, v_flat);
                 }
                 // expose the native cache strides, like the v_cache view below
@@ -2385,7 +2402,8 @@ static ggml_tensor * llm_build_kqv(
                     kv.v_records[kv_layer], kv.v_stage[kv_layer],
                     lctx.inp_kvarn_pos, kq_mask,
                     (int) n_kv, cparams.kvarn.key_bits, cparams.kvarn.value_bits,
-                    kv.kvarn_stage_groups, n_slices, lctx.kvarn_sealed[kv_layer], kq_scale);
+                    kv.kvarn_stage_groups, n_slices, lctx.kvarn_sealed[kv_layer], kq_scale, kv_layer,
+                    lctx.inp_kvarn_state);
             kvarn_register_node(lctx, kv_layer, cur);
             cb(cur, "kvarn_attn", il);
         } else {

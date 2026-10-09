@@ -132,10 +132,16 @@ static void compute_store(
         const struct tensors & ts,
         int kbits, int vbits, int iters, int64_t owner, int64_t sealed, int S = 2) {
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    // per-call device state (g_first, sealed_pre, sealed_post); the CPU
+    // reference uses the op_params, so the values only need to be well-formed
+    struct ggml_tensor * state = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 3);
+    ((int32_t *) state->data)[0] = -1;
+    ((int32_t *) state->data)[1] = int32_t(sealed);
+    ((int32_t *) state->data)[2] = int32_t(sealed);
     struct ggml_tensor * sk = ggml_kvarn_store(ctx, ts.k_cur, ts.idx, ts.k_stage, ts.k_rec,
-            kbits, vbits, iters, false, S, 1, int(owner), int(sealed), -1, 1.0f);
+            kbits, vbits, iters, false, S, 1, int(owner), int(sealed), -1, 1.0f, 0, state);
     struct ggml_tensor * sv = ggml_kvarn_store(ctx, ts.v_cur, ts.idx, ts.v_stage, ts.v_rec,
-            kbits, vbits, iters, true, S, 1, int(owner), int(sealed), -1, 1.0f);
+            kbits, vbits, iters, true, S, 1, int(owner), int(sealed), -1, 1.0f, 0, state);
     ggml_build_forward_expand(gf, sk);
     ggml_build_forward_expand(gf, sv);
     const enum ggml_status st = ggml_graph_compute_with_ctx(ctx, gf, NTH);
@@ -147,10 +153,14 @@ static struct ggml_tensor * compute_materialize(
         const struct tensors & ts,
         int64_t n_kv, int kbits, int vbits, int64_t sealed, bool value, int S = 2) {
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    struct ggml_tensor * state = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 3);
+    ((int32_t *) state->data)[0] = -1;
+    ((int32_t *) state->data)[1] = int32_t(sealed);
+    ((int32_t *) state->data)[2] = int32_t(sealed);
     struct ggml_tensor * out = ggml_kvarn_materialize(ctx,
             value ? ts.v_rec : ts.k_rec,
             value ? ts.v_stage : ts.k_stage,
-            ts.idx_full, int(n_kv), kbits, vbits, value, S, 1, int(sealed));
+            ts.idx_full, int(n_kv), kbits, vbits, value, S, 1, int(sealed), 0, state);
     ggml_build_forward_expand(gf, out);
     const enum ggml_status st = ggml_graph_compute_with_ctx(ctx, gf, NTH);
     CHECK(st == GGML_STATUS_SUCCESS, "materialize graph compute failed: %d", int(st));
@@ -515,10 +525,14 @@ static void test_slices(void) {
             }
         }
         struct ggml_cgraph * gfc = ggml_new_graph(ctx);
+        struct ggml_tensor * state = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 3);
+        ((int32_t *) state->data)[0] = pos0 >= 128 ? int32_t(pos0/128) : -1;
+        ((int32_t *) state->data)[1] = 0;
+        ((int32_t *) state->data)[2] = 0;
         struct ggml_tensor * sk = ggml_kvarn_store(ctx, kc, idx_t, k_stage, k_rec,
-                kbits, vbits, iters, false, S, SLICES, -1, 0, -1, 1.0f);
+                kbits, vbits, iters, false, S, SLICES, -1, 0, -1, 1.0f, 0, state);
         struct ggml_tensor * sv = ggml_kvarn_store(ctx, vc, idx_t, v_stage, v_rec,
-                kbits, vbits, iters, true, S, SLICES, -1, 0, -1, 1.0f);
+                kbits, vbits, iters, true, S, SLICES, -1, 0, -1, 1.0f, 0, state);
         ggml_build_forward_expand(gfc, sk);
         ggml_build_forward_expand(gfc, sv);
         CHECK(ggml_graph_compute_with_ctx(ctx, gfc, NTH) == GGML_STATUS_SUCCESS, "slices: store compute failed");
@@ -532,8 +546,12 @@ static void test_slices(void) {
     struct ggml_tensor * mv;
     {
         struct ggml_cgraph * gfm = ggml_new_graph(ctx);
-        mk = ggml_kvarn_materialize(ctx, k_rec, k_stage, idx512, N, kbits, vbits, false, S, SLICES, 2);
-        mv = ggml_kvarn_materialize(ctx, v_rec, v_stage, idx512, N, kbits, vbits, true,  S, SLICES, 2);
+        struct ggml_tensor * state = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 3);
+        ((int32_t *) state->data)[0] = -1;
+        ((int32_t *) state->data)[1] = 2;
+        ((int32_t *) state->data)[2] = 2;
+        mk = ggml_kvarn_materialize(ctx, k_rec, k_stage, idx512, N, kbits, vbits, false, S, SLICES, 2, 0, state);
+        mv = ggml_kvarn_materialize(ctx, v_rec, v_stage, idx512, N, kbits, vbits, true,  S, SLICES, 2, 0, state);
         ggml_build_forward_expand(gfm, mk);
         ggml_build_forward_expand(gfm, mv);
         CHECK(ggml_graph_compute_with_ctx(ctx, gfm, NTH) == GGML_STATUS_SUCCESS, "slices: materialize compute failed");

@@ -6698,12 +6698,16 @@ struct ggml_tensor * ggml_kvarn_store(
         int                   owner_group,
         int                   sealed_group,
         int                   g_first,
-        float                 alpha) {
+        float                 alpha,
+        int                   state_layer,
+        struct ggml_tensor  * state) {
 
     GGML_ASSERT(current->type == GGML_TYPE_F32);
     GGML_ASSERT(indices->type == GGML_TYPE_I32);
     GGML_ASSERT(stage->type   == GGML_TYPE_F16);
     GGML_ASSERT(records->type == GGML_TYPE_I8);
+    GGML_ASSERT(state_layer >= 0);
+    GGML_ASSERT(state != NULL && state->type == GGML_TYPE_I32 && state->ne[0] % 3 == 0);
     GGML_ASSERT(k_bits >= 2 && k_bits <= 8);
     GGML_ASSERT(v_bits >= 2 && v_bits <= 8);
     GGML_ASSERT(sinkhorn_iters > 0);
@@ -6722,6 +6726,7 @@ struct ggml_tensor * ggml_kvarn_store(
     result->src[1] = indices;
     result->src[2] = stage;
     result->src[3] = records;
+    result->src[4] = state;
 
     result->op_params[0] = value ? v_bits : k_bits;
     result->op_params[1] = sinkhorn_iters;
@@ -6733,6 +6738,7 @@ struct ggml_tensor * ggml_kvarn_store(
     result->op_params[7] = sealed_group;
     result->op_params[8] = g_first;
     result->op_params[10] = n_slices;
+    result->op_params[11] = state_layer;
 
     return result;
 }
@@ -6748,11 +6754,15 @@ struct ggml_tensor * ggml_kvarn_materialize(
         bool                  value,
         int                   stage_groups,
         int                   n_slices,
-        int                   sealed_group) {
+        int                   sealed_group,
+        int                   state_layer,
+        struct ggml_tensor  * state) {
 
     GGML_ASSERT(records->type == GGML_TYPE_I8);
     GGML_ASSERT(stage->type   == GGML_TYPE_F16);
     GGML_ASSERT(indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(state_layer >= 0);
+    GGML_ASSERT(state != NULL && state->type == GGML_TYPE_I32 && state->ne[0] % 3 == 0);
     GGML_ASSERT(k_bits >= 2 && k_bits <= 8);
     GGML_ASSERT(v_bits >= 2 && v_bits <= 8);
     GGML_ASSERT(stage_groups >= 2);
@@ -6767,6 +6777,7 @@ struct ggml_tensor * ggml_kvarn_materialize(
     result->src[0] = records;
     result->src[1] = stage;
     result->src[2] = indices;
+    result->src[3] = state;
 
     result->op_params[0] = value ? v_bits : k_bits;
     result->op_params[1] = 0;
@@ -6776,6 +6787,7 @@ struct ggml_tensor * ggml_kvarn_materialize(
     result->op_params[5] = value ? k_bits : v_bits;
     result->op_params[7] = sealed_group; // same slot as the store
     result->op_params[10] = n_slices;
+    result->op_params[11] = state_layer;
 
     return result;
 }
@@ -6798,9 +6810,13 @@ struct ggml_tensor * ggml_kvarn_store2(
         int                   owner_group,
         int                   sealed_group,
         int                   g_first,
-        float                 alpha) {
+        float                 alpha,
+        int                   state_layer,
+        struct ggml_tensor  * state) {
     GGML_ASSERT(k_cur != NULL || v_cur != NULL);
     GGML_ASSERT(indices != NULL && indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(state_layer >= 0);
+    GGML_ASSERT(state != NULL && state->type == GGML_TYPE_I32 && state->ne[0] % 3 == 0);
     GGML_ASSERT(k_bits >= 2 && k_bits <= 8);
     GGML_ASSERT(v_bits >= 2 && v_bits <= 8);
     GGML_ASSERT(sinkhorn_iters > 0);
@@ -6838,6 +6854,7 @@ struct ggml_tensor * ggml_kvarn_store2(
     result->src[4] = v_stage;
     result->src[5] = k_records;
     result->src[6] = v_records;
+    result->src[7] = state;
 
     result->op_params[0] = k_bits;
     result->op_params[1] = sinkhorn_iters;
@@ -6850,6 +6867,7 @@ struct ggml_tensor * ggml_kvarn_store2(
     result->op_params[8] = g_first;
     result->op_params[9] = 1; // combined
     result->op_params[10] = n_slices;
+    result->op_params[11] = state_layer;
 
     return result;
 }
@@ -6869,12 +6887,16 @@ struct ggml_tensor * ggml_kvarn_materialize2(
         int                   stage_groups,
         int                   n_slices,
         int                   sealed_group,
-        struct ggml_tensor ** v_flat_out) {
+        struct ggml_tensor ** v_flat_out,
+        int                   state_layer,
+        struct ggml_tensor  * state) {
     GGML_ASSERT(k_records && k_records->type == GGML_TYPE_I8);
     GGML_ASSERT(v_records && v_records->type == GGML_TYPE_I8);
     GGML_ASSERT(k_stage && k_stage->type == GGML_TYPE_F16);
     GGML_ASSERT(v_stage && v_stage->type == GGML_TYPE_F16);
     GGML_ASSERT(indices && indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(state_layer >= 0);
+    GGML_ASSERT(state != NULL && state->type == GGML_TYPE_I32 && state->ne[0] % 3 == 0);
     GGML_ASSERT(k_bits >= 2 && k_bits <= 8);
     GGML_ASSERT(v_bits >= 2 && v_bits <= 8);
     GGML_ASSERT(stage_groups >= 2);
@@ -6895,6 +6917,7 @@ struct ggml_tensor * ggml_kvarn_materialize2(
     result->src[3] = v_records;
     result->src[4] = v_stage;
     result->src[5] = v_flat;
+    result->src[6] = state;
 
     result->op_params[0] = k_bits;
     result->op_params[1] = 0;
@@ -6905,6 +6928,7 @@ struct ggml_tensor * ggml_kvarn_materialize2(
     result->op_params[7] = sealed_group;
     result->op_params[9] = 1; // combined
     result->op_params[10] = n_slices;
+    result->op_params[11] = state_layer;
 
     *v_flat_out = v_flat;
     return result;
@@ -6930,7 +6954,9 @@ struct ggml_tensor * ggml_kvarn_attn(
         int                   stage_groups,
         int                   n_slices,
         int                   sealed,
-        float                 kq_scale) {
+        float                 kq_scale,
+        int                   state_layer,
+        struct ggml_tensor  * state) {
     GGML_ASSERT(q && q->type == GGML_TYPE_F32);
     GGML_ASSERT(k_records && k_records->type == GGML_TYPE_I8);
     GGML_ASSERT(v_records && v_records->type == GGML_TYPE_I8);
@@ -6938,6 +6964,8 @@ struct ggml_tensor * ggml_kvarn_attn(
     GGML_ASSERT(v_stage && v_stage->type == GGML_TYPE_F16);
     GGML_ASSERT(indices && indices->type == GGML_TYPE_I32);
     GGML_ASSERT(mask && mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(state_layer >= 0);
+    GGML_ASSERT(state != NULL && state->type == GGML_TYPE_I32 && state->ne[0] % 3 == 0);
     GGML_ASSERT(k_bits >= 2 && k_bits <= 8);
     GGML_ASSERT(v_bits >= 2 && v_bits <= 8);
     GGML_ASSERT(stage_groups >= 2);
@@ -6961,6 +6989,7 @@ struct ggml_tensor * ggml_kvarn_attn(
     result->src[4] = v_stage;
     result->src[5] = indices;
     result->src[6] = mask;
+    result->src[7] = state;
 
     result->op_params[0] = n_kv;
     result->op_params[1] = sealed;
@@ -6969,6 +6998,7 @@ struct ggml_tensor * ggml_kvarn_attn(
     result->op_params[4] = v_bits;
     memcpy(&result->op_params[5], &kq_scale, sizeof(float));
     result->op_params[6] = n_slices;
+    result->op_params[7] = state_layer; /* attn: layer index */
 
     return result;
 }

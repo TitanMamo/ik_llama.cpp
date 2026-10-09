@@ -924,31 +924,36 @@ bool llama_context::kvarn_reuse_check_and_patch(
         if ((size_t) il >= kv_self.k_records.size() || kv_self.k_records[il] == nullptr) {
             continue;
         }
+        // one-call deferral (mirrors llm_build_kv_store): the store seals up to
+        // `sealed_pre`, the materialize/attn read the post-call cutoff
+        const int32_t sealed_pre  = kvarn_sealed[il];
+        const int32_t gf          = g_first >= 1 ? g_first : 1;
+        const int32_t sealed_post = pos_last >= LLAMA_KVARN_GROUP ? std::max(sealed_pre, gf - 1) : sealed_pre;
         for (struct ggml_tensor * t : kvarn_nodes[il]) {
             switch (t->op) {
                 case GGML_OP_KVARN_STORE:
                     t->op_params[GGML_KVARN_OP_OWNER]   = kvarn_owner[il];
-                    t->op_params[GGML_KVARN_OP_SEALED]  = kvarn_sealed[il];
+                    t->op_params[GGML_KVARN_OP_SEALED]  = sealed_pre;
                     t->op_params[GGML_KVARN_OP_G_FIRST] = g_first;
                     break;
                 case GGML_OP_KVARN_MATERIALIZE:
-                    t->op_params[GGML_KVARN_OP_SEALED] = kvarn_sealed[il];
+                    t->op_params[GGML_KVARN_OP_SEALED] = sealed_post;
                     break;
                 case GGML_OP_KVARN_ATTN:
                     // attn op_params: [0]=n_kv [1]=sealed (its own slot layout).
                     // n_kv is a tensor shape here and only changes when the
                     // graph is rebuilt (can_reuse_graph checks kv_self.n).
-                    t->op_params[1] = kvarn_sealed[il];
+                    t->op_params[1] = sealed_post;
                     break;
                 default:
                     break; // validated above
             }
         }
-        // one-call deferral (mirrors llm_build_kv_store): after this call every
-        // group older than its first group lives in records
+        kvarn_state_fill[3*il + 0] = g_first;
+        kvarn_state_fill[3*il + 1] = sealed_pre;
+        kvarn_state_fill[3*il + 2] = sealed_post;
+        kvarn_sealed[il] = sealed_post;
         if (pos_last >= LLAMA_KVARN_GROUP) {
-            const int32_t gf = g_first >= 1 ? g_first : 1;
-            kvarn_sealed[il] = std::max(kvarn_sealed[il], gf - 1);
             kvarn_owner[il]  = pos_last / LLAMA_KVARN_GROUP;
         }
     }
@@ -6406,6 +6411,12 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 #endif
     }
 
+    if (lctx.inp_kvarn_state != nullptr) {
+        // per-call KVarN group state (device-side cutoffs for captured graphs)
+        ggml_backend_tensor_set(lctx.inp_kvarn_state, lctx.kvarn_state_fill.data(), 0,
+                lctx.kvarn_state_fill.size()*ggml_element_size(lctx.inp_kvarn_state));
+    }
+
     if (lctx.inp_mtp_carry) {
         const size_t n_floats = (size_t) ggml_nelements(lctx.inp_mtp_carry);
         if (lctx.mtp_carry_pending) {
@@ -10294,6 +10305,7 @@ struct llama_context * llama_init_from_model(
         if (cparams.kvarn.enabled) {
             ctx->kvarn_owner.assign(model->hparams.n_layer, -1);
             ctx->kvarn_sealed.assign(model->hparams.n_layer, 0);
+            ctx->kvarn_state_fill.assign(3*model->hparams.n_layer, 0);
             ctx->kv_self.kvarn = true;
         }
 

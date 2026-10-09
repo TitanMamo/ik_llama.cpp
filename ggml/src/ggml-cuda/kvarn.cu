@@ -445,19 +445,26 @@ static __global__ void kvarn_store_tile_kernel(
             payload_off, payload_bytes, scale_off, zp_off, other_off);
 }
 
-// Fused ring seal: one block per (group, head-slice); reads the slice's tile
-// from its stage ring block (K is channel-major in the stage, V token-major)
-// and quantizes it into the record.
+// Fused ring seal: one block per (ring slot, head-slice); reads the slice's
+// tile from its stage ring block (K is channel-major in the stage, V
+// token-major) and quantizes it into the record. The block grid covers the
+// whole ring (stage_slots blocks); each block skips itself unless its group
+// lies in (sealed_pre, g_first) as read from the device-side state, so the
+// launch geometry is call-independent (captured CUDA graphs stay valid).
 template <int bits>
 static __global__ void kvarn_seal_kernel(
         const half * __restrict__ stage, uint8_t * __restrict__ records,
+        const int32_t * __restrict__ state, // [0]=g_first, [1]=sealed (before this call)
         const int head_dim, const int n_heads_s, const int stage_rows, const int stage_slots,
-        const int g_begin, const int value, const int iters, const float alpha,
+        const int value, const int iters, const float alpha,
         const size_t record_bytes, const size_t payload_off, const size_t payload_bytes,
         const size_t scale_off, const size_t zp_off, const size_t other_off) {
     extern __shared__ float smem[];
-    const int g  = g_begin + blockIdx.x;
+    const int g  = 1 + blockIdx.x; // ring group for this slot
     const int hh = blockIdx.y; // head-slice index (h*n_slices + s)
+    if (g <= state[1] || g >= state[0]) {
+        return; // this slot's group is not being sealed in this call
+    }
     const int rows = value ? 128 : head_dim;
     const int cols = value ? head_dim : 128;
     const int block = 1 + (g - 1) % stage_slots;
@@ -487,8 +494,9 @@ static __global__ void kvarn_seal_kernel(
 // ---------------------------------------------------------------------------
 __global__ void kvarn_materialize_stage_kernel(
         const int32_t * __restrict__ indices, const half * __restrict__ stage,
-        half * __restrict__ out, const int head_dim, const int head_dim_s, const int n_heads, const int n_slices,
-        const int stage_rows, const int stage_slots, const int sealed) {
+        half * __restrict__ out, const int32_t * __restrict__ state,
+        const int head_dim, const int head_dim_s, const int n_heads, const int n_slices,
+        const int stage_rows, const int stage_slots) {
     const int i = blockIdx.x;
     const int hh = blockIdx.y; // head-slice index (h*n_slices + s)
     const int h = hh / n_slices;
@@ -497,6 +505,7 @@ __global__ void kvarn_materialize_stage_kernel(
     if (d >= head_dim_s) {
         return;
     }
+    const int sealed = state[2]; // groups sealed by this call
     const int pos = indices[i];
     int block;
     if (pos < 128) {
@@ -520,6 +529,7 @@ __global__ void kvarn_materialize_stage_kernel(
 template <int bits>
 static __global__ void kvarn_materialize_records_kernel(
         const int32_t * __restrict__ indices, const uint8_t * __restrict__ records,
+        const int32_t * __restrict__ state,
         half * __restrict__ out, const int n_kv, const int head_dim, const int n_heads_s, const int n_slices,
         const int value, const size_t record_bytes,
         const size_t payload_off, const size_t scale_off,
@@ -529,6 +539,9 @@ static __global__ void kvarn_materialize_records_kernel(
     const int g  = 1 + blockIdx.x;
     const int hh = blockIdx.y; // head-slice index (h*n_slices + s)
     const int tid = threadIdx.x;
+    if (g > state[2]) {
+        return; // this group is not sealed yet (grid covers the whole record set)
+    }
 
     if (tid == 0) {
         const int pos0 = g * 128;
@@ -824,10 +837,10 @@ __global__ void kvarn_materialize_stage2_kernel(
         const int32_t * __restrict__ indices,
         const half * __restrict__ k_stage, const half * __restrict__ v_stage,
         half * __restrict__ k_out, half * __restrict__ v_out,
+        const int32_t * __restrict__ state,
         const int k_dim, const int v_dim, const int k_dim_s, const int v_dim_s,
         const int n_heads, const int n_slices,
-        const int k_rows, const int v_rows, const int k_slots, const int v_slots,
-        const int sealed) {
+        const int k_rows, const int v_rows, const int k_slots, const int v_slots) {
     const int i    = blockIdx.x;
     const int hh   = blockIdx.y; // head-slice index (h*n_slices + s)
     const int side = blockIdx.z;
@@ -844,6 +857,7 @@ __global__ void kvarn_materialize_stage2_kernel(
     const int rows     = side == 0 ? k_rows : v_rows;
     const int slots    = side == 0 ? k_slots : v_slots;
 
+    const int sealed = state[2]; // groups sealed by this call
     const int pos = indices[i];
     int block;
     if (pos < 128) {
@@ -864,8 +878,9 @@ __global__ void kvarn_materialize_records2_kernel(
         const int32_t * __restrict__ indices,
         const uint8_t * __restrict__ k_records, const uint8_t * __restrict__ v_records,
         half * __restrict__ k_out, half * __restrict__ v_out,
+        const int32_t * __restrict__ state,
         const int n_kv, const int k_dim, const int v_dim, const int n_heads, const int n_slices,
-        const int sealed, const int k_bits, const int v_bits,
+        const int k_bits, const int v_bits,
         const size_t k_record_bytes, const size_t v_record_bytes,
         const size_t k_payload_off, const size_t k_scale_off, const size_t k_zp_off, const size_t k_other_off,
         const size_t v_payload_off, const size_t v_scale_off, const size_t v_zp_off, const size_t v_other_off) {
@@ -875,6 +890,9 @@ __global__ void kvarn_materialize_records2_kernel(
     const int hh   = blockIdx.y; // head-slice index (h*n_slices + s)
     const int side = blockIdx.z;
     const int tid  = threadIdx.x;
+    if (g > state[2]) {
+        return; // this group is not sealed yet (grid covers the whole record set)
+    }
 
     if (tid == 0) {
         const int pos0 = g * 128;
@@ -965,9 +983,9 @@ void ggml_cuda_kvarn_materialize2(
         const struct ggml_kvarn_layout * k_layout, const struct ggml_kvarn_layout * v_layout,
         const void * k_records, const void * v_records,
         const void * k_stage, const void * v_stage,
-        const int32_t * indices, void * k_out, void * v_out,
+        const int32_t * indices, const int32_t * state, void * k_out, void * v_out,
         int n_kv, int k_dim, int v_dim, int n_heads, int k_rows, int v_rows,
-        int k_slots, int v_slots, int n_slices, int sealed, int k_bits, int v_bits, cudaStream_t stream) {
+        int k_slots, int v_slots, int n_record_groups, int n_slices, int k_bits, int v_bits, cudaStream_t stream) {
     if (n_kv <= 0) {
         return;
     }
@@ -979,18 +997,19 @@ void ggml_cuda_kvarn_materialize2(
         dim3 grid(n_kv, n_heads_s, 2);
         kvarn_materialize_stage2_kernel<<<grid, dim_max, 0, stream>>>(
                 indices, (const half *) k_stage, (const half *) v_stage,
-                (half *) k_out, (half *) v_out,
-                k_dim, v_dim, k_dim_s, v_dim_s, n_heads, n_slices, k_rows, v_rows, k_slots, v_slots, sealed);
+                (half *) k_out, (half *) v_out, state,
+                k_dim, v_dim, k_dim_s, v_dim_s, n_heads, n_slices, k_rows, v_rows, k_slots, v_slots);
         kvarn_launch_ok("kvarn materialize stage2");
     }
-    if (sealed >= 1) {
+    {
         const int dim_max = k_dim_s > v_dim_s ? k_dim_s : v_dim_s;
         const size_t smem_bytes = size_t(dim_max) * 128 * sizeof(half);
-        dim3 grid(sealed, n_heads_s, 2);
+        // fixed geometry: one block per record slot, blocks skip per device state
+        dim3 grid(n_record_groups, n_heads_s, 2);
         kvarn_materialize_records2_kernel<<<grid, 256, smem_bytes, stream>>>(
                 indices, (const uint8_t *) k_records, (const uint8_t *) v_records,
-                (half *) k_out, (half *) v_out,
-                n_kv, k_dim_s, v_dim_s, n_heads, n_slices, sealed, k_bits, v_bits,
+                (half *) k_out, (half *) v_out, state,
+                n_kv, k_dim_s, v_dim_s, n_heads, n_slices, k_bits, v_bits,
                 k_layout->record_bytes, v_layout->record_bytes,
                 k_layout->k_payload_off, k_layout->k_scale_off, k_layout->k_zp_off, k_layout->k_other_off,
                 v_layout->v_payload_off, v_layout->v_scale_off, v_layout->v_zp_off, v_layout->v_other_off);
@@ -1004,11 +1023,12 @@ void ggml_cuda_kvarn_materialize2(
 
 void ggml_cuda_kvarn_seal(
         const struct ggml_kvarn_layout * layout, const void * stage, void * records,
+        const int32_t * state,
         int head_dim, int n_heads, int stage_rows, int stage_slots,
-        int g_begin, int n_seal, int n_slices, bool value, int bits, int iters, float alpha,
+        int n_record_groups, int n_slices, bool value, int bits, int iters, float alpha,
         cudaStream_t stream) {
-    if (n_seal <= 0) {
-        return;
+    if (getenv("IK_KVARN_SKIP_SEAL") != nullptr) {
+        return; // timing diagnostic only
     }
     const int head_dim_s = head_dim / n_slices;
     const int n_heads_s  = n_heads * n_slices;
@@ -1021,7 +1041,9 @@ void ggml_cuda_kvarn_seal(
     const size_t other_off     = value ? layout->v_other_off     : layout->k_other_off;
     const size_t smem_bytes = (size_t(rows) * cols + 3 * size_t(rows + cols) + 258) * sizeof(float);
 
-    dim3 grid(n_seal, n_heads_s);
+    // fixed geometry: one block per record group; blocks skip themselves
+    // unless their group is in (sealed, g_first), read from `state` on device
+    dim3 grid(n_record_groups, n_heads_s);
 #define KVARN_LAUNCH_SEAL(B) do { \
         static bool kvarn_attr_done_##B = false; \
         if (!kvarn_attr_done_##B) { \
@@ -1030,8 +1052,8 @@ void ggml_cuda_kvarn_seal(
             kvarn_attr_done_##B = true; \
         } \
         kvarn_seal_kernel<B><<<grid, 128, smem_bytes, stream>>>( \
-                (const half *) stage, (uint8_t *) records, \
-                head_dim_s, n_heads_s, stage_rows, stage_slots, g_begin, value ? 1 : 0, iters, alpha, \
+                (const half *) stage, (uint8_t *) records, state, \
+                head_dim_s, n_heads_s, stage_rows, stage_slots, value ? 1 : 0, iters, alpha, \
                 layout->record_bytes, payload_off, payload_bytes, scale_off, zp_off, other_off); \
         kvarn_launch_ok("kvarn seal"); \
     } while (0)
@@ -1056,8 +1078,9 @@ void ggml_cuda_kvarn_seal(
 void ggml_cuda_kvarn_materialize(
         const struct ggml_kvarn_layout * layout,
         const void * records, const void * stage, const int32_t * indices,
+        const int32_t * state,
         void * out, int n_kv, int head_dim, int n_heads, int stage_rows, int stage_slots,
-        int sealed, int n_slices, bool value, int bits, cudaStream_t stream) {
+        int n_record_groups, int n_slices, bool value, int bits, cudaStream_t stream) {
     if (n_kv <= 0) {
         return;
     }
@@ -1066,20 +1089,22 @@ void ggml_cuda_kvarn_materialize(
     {
         dim3 grid(n_kv, n_heads_s);
         kvarn_materialize_stage_kernel<<<grid, head_dim_s, 0, stream>>>(
-                indices, (const half *) stage, (half *) out,
-                head_dim, head_dim_s, n_heads, n_slices, stage_rows, stage_slots, sealed);
+                indices, (const half *) stage, (half *) out, state,
+                head_dim, head_dim_s, n_heads, n_slices, stage_rows, stage_slots);
         kvarn_launch_ok("kvarn materialize stage");
     }
-    if (sealed >= 1) {
+    {
         const size_t payload_off = value ? layout->v_payload_off : layout->k_payload_off;
         const size_t scale_off   = value ? layout->v_scale_off   : layout->k_scale_off;
         const size_t zp_off      = value ? layout->v_zp_off      : layout->k_zp_off;
         const size_t other_off   = value ? layout->v_other_off   : layout->k_other_off;
         const size_t smem_bytes  = size_t(128) * size_t(head_dim_s) * sizeof(half);
-        dim3 grid(sealed, n_heads_s);
+        // fixed geometry: one block per record slot, blocks skip per device state
+        dim3 grid(n_record_groups, n_heads_s);
 #define KVARN_LAUNCH_MAT(B) do { \
             kvarn_materialize_records_kernel<B><<<grid, 256, smem_bytes, stream>>>( \
-                    indices, (const uint8_t *) records, (half *) out, n_kv, head_dim_s, n_heads_s, n_slices, \
+                    indices, (const uint8_t *) records, state, (half *) out, \
+                    n_kv, head_dim_s, n_heads_s, n_slices, \
                     value ? 1 : 0, layout->record_bytes, payload_off, scale_off, zp_off, other_off); \
             kvarn_launch_ok("kvarn materialize records"); \
         } while (0)
@@ -1113,7 +1138,8 @@ __global__ void kvarn_attn_kernel(
         const int n_kv, const int Dk, const int Dk_s, const int Dv, const int Dv_s, const int n_slices,
         const int Hq, const int Hkv,
         const int k_rows, const int v_rows, const int slots,
-        const int sealed, const int k_bits, const int v_bits, const float kq_scale,
+        const int32_t * __restrict__ state,
+        const int k_bits, const int v_bits, const float kq_scale,
         const size_t k_record_bytes, const size_t v_record_bytes,
         const size_t k_payload_off, const size_t k_scale_off, const size_t k_zp_off, const size_t k_other_off,
         const size_t v_payload_off, const size_t v_scale_off, const size_t v_zp_off, const size_t v_other_off) {
@@ -1121,6 +1147,7 @@ __global__ void kvarn_attn_kernel(
     float * S   = smem;         // [n_kv]
     float * red = smem + n_kv;  // [blockDim.x]
 
+    const int sealed = state[2]; // groups sealed by this call
     const int hq = blockIdx.x;
     const int h = hq / (Hq / Hkv);
     const int tid = threadIdx.x;
@@ -1248,6 +1275,12 @@ static void kvarn_dump_dev(const void * dev, size_t bytes, const char * name, cu
     if (dir == nullptr) {
         return;
     }
+    // a D2H copy + host sync is illegal while the stream is being captured
+    // (KVarN kernels participate in CUDA graph captures)
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cap) == cudaSuccess && cap != cudaStreamCaptureStatusNone) {
+        return;
+    }
     char path[1024];
     snprintf(path, sizeof(path), "%s/%s.bin", dir, name);
     std::vector<char> host(bytes);
@@ -1317,8 +1350,6 @@ static void kvarn_store2_op(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int   other = kvarn_op_int(dst, GGML_KVARN_OP_OTHER_BITS);
     const int   iters = kvarn_op_int(dst, GGML_KVARN_OP_ITERS);
     const float alpha = kvarn_op_float(dst, GGML_KVARN_OP_ALPHA);
-    const int   sealed  = kvarn_op_int(dst, GGML_KVARN_OP_SEALED);
-    const int   g_first = kvarn_op_int(dst, GGML_KVARN_OP_G_FIRST);
     const int   S       = kvarn_op_int(dst, GGML_KVARN_OP_STAGE_GRP);
     const int   n_slices = kvarn_op_int(dst, GGML_KVARN_OP_SLICES);
 
@@ -1346,14 +1377,25 @@ static void kvarn_store2_op(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     cudaStream_t stream = ctx.stream();
 
-    // 1. seal completed groups for both sides (MUST run before the stage writes)
-    const int n_seal = (g_first >= 1) ? g_first - 1 - sealed : 0;
-    if (n_seal > 0) {
-        ggml_cuda_kvarn_seal(&k_layout, k_stage->data, k_rec->data, kD, H, k_rows, slots,
-                sealed + 1, n_seal, n_slices, false, bits, iters, alpha, stream);
-        ggml_cuda_kvarn_seal(&v_layout, v_stage->data, v_rec->data, vD, H, v_rows, slots,
-                sealed + 1, n_seal, n_slices, true, other, iters, alpha, stream);
+    // per-call group state (device memory; fixed launch geometry below)
+    const ggml_tensor * state = dst->src[7];
+    GGML_ASSERT(state != nullptr && state->type == GGML_TYPE_I32);
+    // ONE shared state tensor; this op's 3 ints live at state + 3*layer
+    const int32_t * st = (const int32_t *) state->data + 3*kvarn_op_int(dst, GGML_KVARN_OP_LAYER);
+
+    if (getenv("IK_KVARN_SKIP_STORE") != nullptr) {
+        return; // timing diagnostic only
     }
+
+    // 1. seal completed groups for both sides (MUST run before the stage
+    // writes). Unconditional fixed-geometry launches; every block skips
+    // itself unless its group is in (sealed, g_first), read from `state`
+    // on device so captured CUDA graphs replay with current cutoffs.
+    const int n_record_groups = (int) (k_rec->ne[1] / H_s);
+    ggml_cuda_kvarn_seal(&k_layout, k_stage->data, k_rec->data, st,
+            kD, H, k_rows, slots, n_record_groups, n_slices, false, bits, iters, alpha, stream);
+    ggml_cuda_kvarn_seal(&v_layout, v_stage->data, v_rec->data, st,
+            vD, H, v_rows, slots, n_record_groups, n_slices, true, other, iters, alpha, stream);
 
     // 2. one launch writes both stages
     ggml_cuda_kvarn_stage_write2((const float *) k_cur->data, (const float *) v_cur->data,
@@ -1373,16 +1415,18 @@ static void kvarn_materialize2_op(ggml_backend_cuda_context & ctx, ggml_tensor *
     const ggml_tensor * v_rec   = dst->src[3];
     const ggml_tensor * v_stage = dst->src[4];
     const ggml_tensor * v_flat  = dst->src[5];
+    const ggml_tensor * state   = dst->src[6];
 
-    const ggml_tensor * srcs[6] = { k_rec, k_stage, indices, v_rec, v_stage, v_flat };
-    if (!kvarn_all_device(srcs, 6) || dst->buffer == nullptr || ggml_backend_buffer_is_host(dst->buffer)) {
+    const ggml_tensor * srcs[7] = { k_rec, k_stage, indices, v_rec, v_stage, v_flat, state };
+    if (!kvarn_all_device(srcs, 7) || dst->buffer == nullptr || ggml_backend_buffer_is_host(dst->buffer)) {
         GGML_ABORT("KVarN materialize2: mixed CPU/GPU KV-cache offload is unsupported "
                    "(all tensors must be CUDA-resident)");
     }
+    GGML_ASSERT(state != nullptr && state->type == GGML_TYPE_I32);
+    const int32_t * st = (const int32_t *) state->data + 3*kvarn_op_int(dst, GGML_KVARN_OP_LAYER);
 
     const int k_bits = kvarn_op_int(dst, GGML_KVARN_OP_BITS);
     const int v_bits = kvarn_op_int(dst, GGML_KVARN_OP_OTHER_BITS);
-    const int sealed = kvarn_op_int(dst, GGML_KVARN_OP_SEALED);
     const int S      = kvarn_op_int(dst, GGML_KVARN_OP_STAGE_GRP);
     const int n_slices = kvarn_op_int(dst, GGML_KVARN_OP_SLICES);
 
@@ -1408,10 +1452,12 @@ static void kvarn_materialize2_op(ggml_backend_cuda_context & ctx, ggml_tensor *
     GGML_ASSERT((size_t) k_rec->ne[0] == k_layout.record_bytes);
     GGML_ASSERT((size_t) v_rec->ne[0] == v_layout.record_bytes);
 
+    const int n_record_groups = (int) (k_rec->ne[1] / H_s);
+
     ggml_cuda_kvarn_materialize2(&k_layout, &v_layout,
             k_rec->data, v_rec->data, k_stage->data, v_stage->data,
-            (const int32_t *) indices->data, dst->data, v_flat->data,
-            n_kv, kD, vD, H, k_rows, v_rows, slots, slots, n_slices, sealed, k_bits, v_bits, ctx.stream());
+            (const int32_t *) indices->data, st, dst->data, v_flat->data,
+            n_kv, kD, vD, H, k_rows, v_rows, slots, slots, n_record_groups, n_slices, k_bits, v_bits, ctx.stream());
 }
 
 void ggml_cuda_kvarn_attn_op(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -1422,15 +1468,18 @@ void ggml_cuda_kvarn_attn_op(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const ggml_tensor * v_stage = dst->src[4];
     const ggml_tensor * indices = dst->src[5];
     const ggml_tensor * mask    = dst->src[6];
+    const ggml_tensor * state   = dst->src[7];
 
-    const ggml_tensor * srcs[7] = { q, k_rec, k_stage, v_rec, v_stage, indices, mask };
-    if (!kvarn_all_device(srcs, 7) || dst->buffer == nullptr || ggml_backend_buffer_is_host(dst->buffer)) {
+    const ggml_tensor * srcs[8] = { q, k_rec, k_stage, v_rec, v_stage, indices, mask, state };
+    if (!kvarn_all_device(srcs, 8) || dst->buffer == nullptr || ggml_backend_buffer_is_host(dst->buffer)) {
         GGML_ABORT("KVarN attn: mixed CPU/GPU KV-cache offload is unsupported "
                    "(all tensors must be CUDA-resident)");
     }
+    GGML_ASSERT(state != nullptr && state->type == GGML_TYPE_I32);
+    // attn keeps the layer index in its own slot 7
+    const int32_t * st = (const int32_t *) state->data + 3*kvarn_op_int(dst, 7);
 
     const int   n_kv    = kvarn_op_int(dst, 0);
-    const int   sealed  = kvarn_op_int(dst, 1);
     const int   S       = kvarn_op_int(dst, 2);
     const int   k_bits  = kvarn_op_int(dst, 3);
     const int   v_bits  = kvarn_op_int(dst, 4);
@@ -1467,7 +1516,7 @@ void ggml_cuda_kvarn_attn_op(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             (const int32_t *) indices->data, (const half *) mask->data,
             (float *) dst->data,
             n_kv, Dk, Dk_s, Dv, Dv_s, n_slices, Hq, Hkv, k_rows, v_rows, slots,
-            sealed, k_bits, v_bits, kq_scale,
+            st, k_bits, v_bits, kq_scale,
             k_layout.record_bytes, v_layout.record_bytes,
             k_layout.k_payload_off, k_layout.k_scale_off, k_layout.k_zp_off, k_layout.k_other_off,
             v_layout.v_payload_off, v_layout.v_scale_off, v_layout.v_zp_off, v_layout.v_other_off);
@@ -1483,21 +1532,22 @@ void ggml_cuda_kvarn_store_op(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const ggml_tensor * indices = dst->src[1];
     const ggml_tensor * stage   = dst->src[2];
     const ggml_tensor * records = dst->src[3];
+    const ggml_tensor * state   = dst->src[4];
 
-    const ggml_tensor * srcs[4] = { current, indices, stage, records };
-    if (!kvarn_all_device(srcs, 4) ||
+    const ggml_tensor * srcs[5] = { current, indices, stage, records, state };
+    if (!kvarn_all_device(srcs, 5) ||
             dst->buffer == nullptr || ggml_backend_buffer_is_host(dst->buffer)) {
         GGML_ABORT("KVarN store: mixed CPU/GPU KV-cache offload is unsupported "
                    "(all tensors must be CUDA-resident)");
     }
+    GGML_ASSERT(state != nullptr && state->type == GGML_TYPE_I32);
+    const int32_t * st = (const int32_t *) state->data + 3*kvarn_op_int(dst, GGML_KVARN_OP_LAYER);
 
     const bool  value   = kvarn_op_int(dst, GGML_KVARN_OP_VALUE) != 0;
     const int   bits    = kvarn_op_int(dst, GGML_KVARN_OP_BITS);
     const int   other   = kvarn_op_int(dst, GGML_KVARN_OP_OTHER_BITS);
     const int   iters   = kvarn_op_int(dst, GGML_KVARN_OP_ITERS);
     const float alpha   = kvarn_op_float(dst, GGML_KVARN_OP_ALPHA);
-    const int   sealed  = kvarn_op_int(dst, GGML_KVARN_OP_SEALED);
-    const int   g_first = kvarn_op_int(dst, GGML_KVARN_OP_G_FIRST);
     const int   S       = kvarn_op_int(dst, GGML_KVARN_OP_STAGE_GRP);
     const int   n_slices = kvarn_op_int(dst, GGML_KVARN_OP_SLICES);
 
@@ -1517,11 +1567,17 @@ void ggml_cuda_kvarn_store_op(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     cudaStream_t stream = ctx.stream();
 
+    if (getenv("IK_KVARN_SKIP_STORE") != nullptr) {
+        return; // timing diagnostic only
+    }
+
     // 1. seal every group completed in a previous call (one-call deferral).
     // This MUST run before the stage writes: a group's ring block may be
     // reused by a group of the current call (e.g. at ub=512, group 7 wraps to
     // block 1 while group 1 is being sealed from it), and the CPU reference
-    // seals before writing for the same reason.
+    // seals before writing for the same reason. Unconditional fixed-geometry
+    // launch; every block skips itself unless its group is in (sealed,
+    // g_first), read from `state` on device.
     {
         static int dbg_pre_k = 0;
         static int dbg_pre_v = 0;
@@ -1533,11 +1589,8 @@ void ggml_cuda_kvarn_store_op(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
         ++pctr;
     }
-    const int n_seal = (g_first >= 1) ? g_first - 1 - sealed : 0;
-    if (n_seal > 0) {
-        ggml_cuda_kvarn_seal(&layout, stage->data, records->data,
-                D, H, stage_rows, stage_slots, sealed + 1, n_seal, n_slices, value, bits, iters, alpha, stream);
-    }
+    ggml_cuda_kvarn_seal(&layout, stage->data, records->data, st,
+            D, H, stage_rows, stage_slots, (int) (records->ne[1] / H_s), n_slices, value, bits, iters, alpha, stream);
 
     // 2. stage write (ring addressing)
     ggml_cuda_kvarn_stage_write((const float *) current->data, (const int32_t *) indices->data,
@@ -1574,18 +1627,20 @@ void ggml_cuda_kvarn_materialize_op(ggml_backend_cuda_context & ctx, ggml_tensor
     const ggml_tensor * records = dst->src[0];
     const ggml_tensor * stage   = dst->src[1];
     const ggml_tensor * indices = dst->src[2];
+    const ggml_tensor * state   = dst->src[3];
 
-    const ggml_tensor * srcs[3] = { records, stage, indices };
-    if (!kvarn_all_device(srcs, 3) ||
+    const ggml_tensor * srcs[4] = { records, stage, indices, state };
+    if (!kvarn_all_device(srcs, 4) ||
             dst->buffer == nullptr || ggml_backend_buffer_is_host(dst->buffer)) {
         GGML_ABORT("KVarN materialize: mixed CPU/GPU KV-cache offload is unsupported "
                    "(all tensors must be CUDA-resident)");
     }
+    GGML_ASSERT(state != nullptr && state->type == GGML_TYPE_I32);
+    const int32_t * st = (const int32_t *) state->data + 3*kvarn_op_int(dst, GGML_KVARN_OP_LAYER);
 
     const bool value  = kvarn_op_int(dst, GGML_KVARN_OP_VALUE) != 0;
     const int  bits   = kvarn_op_int(dst, GGML_KVARN_OP_BITS);
     const int  other  = kvarn_op_int(dst, GGML_KVARN_OP_OTHER_BITS);
-    const int  sealed = kvarn_op_int(dst, GGML_KVARN_OP_SEALED);
     const int  S      = kvarn_op_int(dst, GGML_KVARN_OP_STAGE_GRP);
     const int  n_slices = kvarn_op_int(dst, GGML_KVARN_OP_SLICES);
 
@@ -1605,9 +1660,11 @@ void ggml_cuda_kvarn_materialize_op(ggml_backend_cuda_context & ctx, ggml_tensor
             D_s, 128, value ? other : bits, value ? bits : other);
     GGML_ASSERT((size_t) records->ne[0] == layout.record_bytes);
 
+    const int n_record_groups = (int) (records->ne[1] / H_s);
+
     ggml_cuda_kvarn_materialize(&layout, records->data, stage->data,
-            (const int32_t *) indices->data, dst->data, n_kv, D, H,
-            stage_rows, stage_slots, sealed, n_slices, value, bits, ctx.stream());
+            (const int32_t *) indices->data, st, dst->data, n_kv, D, H,
+            stage_rows, stage_slots, n_record_groups, n_slices, value, bits, ctx.stream());
 
     {
         static int dbg_mat_k = 0;

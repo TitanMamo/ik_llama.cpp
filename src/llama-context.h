@@ -674,6 +674,7 @@ struct llama_context {
     struct ggml_tensor * inp_pos;         // I32 [n_batch]
     struct ggml_tensor * inp_kvarn_ids;   // I32 [n_tokens] positions for the KVarN store
     struct ggml_tensor * inp_kvarn_pos;   // I32 [n_kv] 0..n_kv-1 for KVarN materialize
+    struct ggml_tensor * inp_kvarn_state; // I32 [3*n_layer] per-call group state (capture-safe cutoffs)
     struct ggml_tensor * inp_out_ids;     // I32 [n_outputs]
     struct ggml_tensor * inp_KQ_mask;     // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_KQ_mask_swa; // F32 [kv_size, n_batch]
@@ -767,6 +768,11 @@ struct llama_context {
     std::vector<int32_t> kvarn_owner;
     // KVarN: per-layer highest group already sealed into a record
     std::vector<int32_t> kvarn_sealed;
+    // KVarN: per-layer per-call group state uploaded as a device input every
+    // call ([0]=g_first, [1]=sealed before the call, [2]=sealed after it) so
+    // that captured CUDA graphs replay with the current cutoffs. Filled by the
+    // graph build (or the reuse patch) alongside the op_params.
+    std::vector<int32_t> kvarn_state_fill;
     // KVarN graph-reuse support: the stateful nodes (store/materialize/attn) of
     // the last built graph, registered per layer, so that a reused graph gets
     // the per-call group state (owner/sealed/g_first) patched before every

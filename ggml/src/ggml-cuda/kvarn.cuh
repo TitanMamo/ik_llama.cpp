@@ -100,20 +100,23 @@ void ggml_cuda_kvarn_stage_write(
         int n_slices,
         cudaStream_t stream);
 
-// Seal (producer): quantize completed ring groups [g_begin, g_begin + n_seal)
-// of `stage` into their records. One block per (group, head-slice);
-// `bits` selects the payload width of this side, `layout` carries both sides'
-// offsets.
+// Seal (producer): quantize the completed ring groups in (sealed, g_first) of
+// `stage` into their records. `state` is a device I32[3]: [0]=g_first,
+// [1]=sealed before this call, [2]=sealed after (materialize/attn cutoff).
+// Fixed geometry: one block per (record group, head-slice); each block skips
+// itself unless its group is in range, so captured CUDA graphs replays with
+// current cutoffs. `bits` selects the payload width of this side, `layout`
+// carries both sides' offsets.
 void ggml_cuda_kvarn_seal(
         const struct ggml_kvarn_layout * layout,
         const void * stage,
         void * records,
+        const int32_t * state,
         int head_dim,
         int n_heads,
         int stage_rows,
         int stage_slots,
-        int g_begin,
-        int n_seal,
+        int n_record_groups,
         int n_slices,
         bool value,
         int bits,
@@ -124,7 +127,7 @@ void ggml_cuda_kvarn_seal(
 // Materialize: reconstruct the native cell-major F16 span [head_dim*n_heads,
 // n_kv] (element (d,i,h) at h*head_dim + s*head_dim_s + d + i*head_dim*n_heads).
 // Sink (pos < 128) and live ring groups are copied from `stage`; groups
-// 1..sealed are decoded from `records`. `indices` must be ascending (v1: one
+// 1..state[2] are decoded from `records`. `indices` must be ascending (v1: one
 // contiguous token stream); duplicate positions are handled by the
 // lower/upper bounds.
 void ggml_cuda_kvarn_materialize(
@@ -132,13 +135,14 @@ void ggml_cuda_kvarn_materialize(
         const void * records,
         const void * stage,
         const int32_t * indices,
+        const int32_t * state,
         void * out,
         int n_kv,
         int head_dim,
         int n_heads,
         int stage_rows,
         int stage_slots,
-        int sealed,
+        int n_record_groups,
         int n_slices,
         bool value,
         int bits,

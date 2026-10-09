@@ -1241,6 +1241,16 @@ extern "C" {
     //                 scales are s**alpha. 1.0 is the reference KVarN and the
     //                 default; lower values trade token-scale fidelity for
     //                 attention-output accuracy on static proxies.
+    //   state       : I32 [3 * n_layer] per-call group state, read by the CUDA
+    //                 kernels from device memory (fixed launch geometry + device-
+    //                 side cutoffs keep captured CUDA graphs valid across calls).
+    //                 `state_layer` (il) selects this op's 3 ints:
+    //                 [3*il+0] = g_first, [3*il+1] = sealed before this call
+    //                 (store), [3*il+2] = sealed after it (materialize/attn).
+    //                 One shared tensor (not a per-layer view) keeps the
+    //                 scheduler from making a per-layer input copy. The scalar
+    //                 arguments above remain authoritative for the CPU
+    //                 reference and are kept in sync by the caller.
     GGML_API struct ggml_tensor * ggml_kvarn_store(
             struct ggml_context * ctx,
             struct ggml_tensor  * current,
@@ -1256,7 +1266,9 @@ extern "C" {
             int                   owner_group,   // newest group being staged, or -1
             int                   sealed_group,  // highest group already written to a record
             int                   g_first,       // first group of this call, or -1
-            float                 alpha);
+            float                 alpha,
+                    int                 state_layer,
+            struct ggml_tensor  * state);
 
     // Reconstructs a dense F16 tensor [head_dim*n_head_kv, n_kv] (native cache
     // layout: cells are rows) from records and staging, to be viewed as
@@ -1273,7 +1285,9 @@ extern "C" {
             bool                  value,
             int                   stage_groups,
             int                   n_slices,
-            int                   sealed_group);
+            int                   sealed_group,
+                    int                   state_layer,
+            struct ggml_tensor  * state);
 
     // Combined K+V variants: one graph node per layer (and one launch per
     // kernel on the CUDA backend) handles both sides. The store2 writes both
@@ -1298,7 +1312,9 @@ extern "C" {
             int                   owner_group,
             int                   sealed_group,
             int                   g_first,
-            float                 alpha);
+            float                 alpha,
+                    int                 state_layer,
+            struct ggml_tensor  * state);
 
     GGML_API struct ggml_tensor * ggml_kvarn_materialize2(
             struct ggml_context * ctx,
@@ -1313,7 +1329,9 @@ extern "C" {
             int                   stage_groups,
             int                   n_slices,
             int                   sealed_group,
-            struct ggml_tensor ** v_flat_out);
+            struct ggml_tensor ** v_flat_out,
+                    int                   state_layer,
+            struct ggml_tensor  * state);
 
     // KVarN decode attention (P5): computes attention for one query token
     // directly from the structured cache (records + F16 ring stage), without
@@ -1338,7 +1356,9 @@ extern "C" {
             int                   stage_groups,
             int                   n_slices,
             int                   sealed_group,
-            float                 kq_scale);
+            float                 kq_scale,
+                    int                   state_layer,
+            struct ggml_tensor  * state);
 
     // dst = a
     // view(dst, nb1, nb2, nb3, offset) += b

@@ -29,6 +29,7 @@ enum {
     GGML_KVARN_OP_G_FIRST    = 8, // first group touched by this store call, or -1
     GGML_KVARN_OP_COMBINED   = 9, // 1 for the K+V combined variants (store2/materialize2)
     GGML_KVARN_OP_SLICES     = 10, // 128-wide channel slices per head (1/2/4); attn keeps it in slot 6
+    GGML_KVARN_OP_LAYER      = 11, // layer index into the device state tensor (also attn slot 7)
 };
 
 // CPU compute entry points (GGML_OP_KVARN_STORE / GGML_OP_KVARN_MATERIALIZE /

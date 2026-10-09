@@ -4577,11 +4577,12 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
 
         if (ggml_is_noop(node)) continue;
 
-        // KVarN note: capture was disabled here originally (the seal launches
-        // are host-conditional and the cutoffs are per-call state), but the
-        // CUDA graph update path handles parameter/shape changes and the
-        // per-token individual launches cost ~10% at decode. Capture stays
-        // enabled; correctness is covered by the PPL checks.
+        // KVarN ops keep captured CUDA graphs valid: their per-call cutoffs
+        // (seal range, owner/sealed group indices) live in a device-resident
+        // state tensor refreshed every call and all KVarN launches use fixed
+        // geometry with in-kernel early exits. Do not reintroduce host-side
+        // per-call conditionals in the KVarN dispatch without re-checking
+        // capture correctness.
 
         if (node->op == GGML_OP_REDUCE) {
             use_cuda_graph = false;
