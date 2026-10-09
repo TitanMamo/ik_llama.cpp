@@ -280,6 +280,12 @@ struct cmd_params {
     output_formats output_format_stderr;
     std::vector<int32_t> cpu_affinity;
     bool cpu_affinity_auto = false;
+    // KVarN cache type strings ("kvarnN"); when set, an ordinary ggml type is
+    // replaced by F16 + KVarN records (see to_llama_cparams)
+    std::string kvarn_k = "f16";
+    std::string kvarn_v = "f16";
+    bool khad = false;
+    bool vhad = false;
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -593,13 +599,18 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 invalid_param = true;
                 break;
             }
+            params.kvarn_k = argv[i];
             auto p = string_split<std::string>(argv[i], split_delim);
             std::vector<ggml_type> types;
             for (const auto & t : p) {
                 ggml_type gt = ggml_type_from_name(t);
                 if (gt == GGML_TYPE_COUNT) {
-                    invalid_param = true;
-                    break;
+                    if (t.rfind("kvarn", 0) == 0) {
+                        gt = GGML_TYPE_F16; // placeholder; to_llama_cparams enables KVarN
+                    } else {
+                        invalid_param = true;
+                        break;
+                    }
                 }
                 types.push_back(gt);
             }
@@ -609,17 +620,26 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 invalid_param = true;
                 break;
             }
+            params.kvarn_v = argv[i];
             auto p = string_split<std::string>(argv[i], split_delim);
             std::vector<ggml_type> types;
             for (const auto & t : p) {
                 ggml_type gt = ggml_type_from_name(t);
                 if (gt == GGML_TYPE_COUNT) {
-                    invalid_param = true;
-                    break;
+                    if (t.rfind("kvarn", 0) == 0) {
+                        gt = GGML_TYPE_F16; // placeholder; to_llama_cparams enables KVarN
+                    } else {
+                        invalid_param = true;
+                        break;
+                    }
                 }
                 types.push_back(gt);
             }
             params.type_v.insert(params.type_v.end(), types.begin(), types.end());
+        } else if (arg == "-khad" || arg == "--k-cache-hadamard") {
+            params.khad = true;
+        } else if (arg == "-vhad" || arg == "--v-cache-hadamard") {
+            params.vhad = true;
         } else if (arg == "-t" || arg == "--threads") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -1027,6 +1047,10 @@ struct cmd_params_instance {
     int  fit_margin = 0;
     const llama_model_tensor_buft_override* buft_overrides;
     std::vector<int32_t> cpu_affinity;
+    std::string kvarn_k = "f16";
+    std::string kvarn_v = "f16";
+    bool khad = false;
+    bool vhad = false;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1082,6 +1106,8 @@ struct cmd_params_instance {
         cparams.n_ubatch = n_ubatch;
         cparams.type_k = type_k;
         cparams.type_v = type_v;
+        cparams.k_cache_hadamard = khad;
+        cparams.v_cache_hadamard = vhad;
         cparams.offload_kqv = !no_kv_offload;
         cparams.flash_attn = flash_attn;
         cparams.mla_attn = mla_attn;
@@ -1099,6 +1125,19 @@ struct cmd_params_instance {
         cparams.scheduler_async = sas;
         cparams.cpu_affinity    = cpu_affinity.empty() ? nullptr : cpu_affinity.data();
         cparams.n_cpu_affinity  = (int32_t) cpu_affinity.size();
+
+        if (kvarn_k.rfind("kvarn", 0) == 0 || kvarn_v.rfind("kvarn", 0) == 0) {
+            const char * err = nullptr;
+            if (!llama_kvarn_params_from_cache_types(&cparams.kvarn, kvarn_k.c_str(), kvarn_v.c_str(), &err)) {
+                fprintf(stderr, "llama-bench: invalid KVarN cache types: %s\n", err != nullptr ? err : "?");
+                exit(1);
+            }
+            if (cparams.kvarn.enabled) {
+                cparams.type_k     = GGML_TYPE_F16;
+                cparams.type_v     = GGML_TYPE_F16;
+                cparams.flash_attn = true; // the materialized cache is consumed by FA
+            }
+        }
 
         return cparams;
     }
@@ -1170,6 +1209,11 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit          = */ params.fit,
                 /* .git_margin   = */ params.fit_margin,
                 /* .buft_overrides=*/ params.buft_overrides.data(),
+                /* .cpu_affinity =*/ params.cpu_affinity,
+                /* .kvarn_k      =*/ params.kvarn_k,
+                /* .kvarn_v      =*/ params.kvarn_v,
+                /* .khad        =*/ params.khad,
+                /* .vhad        =*/ params.vhad,
             };
             instances.push_back(instance);
         }
@@ -1217,6 +1261,11 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit          = */ params.fit,
                 /* .git_margin   = */ params.fit_margin,
                 /* .buft_overrides=*/ params.buft_overrides.data(),
+                /* .cpu_affinity =*/ params.cpu_affinity,
+                /* .kvarn_k      =*/ params.kvarn_k,
+                /* .kvarn_v      =*/ params.kvarn_v,
+                /* .khad        =*/ params.khad,
+                /* .vhad        =*/ params.vhad,
             };
             instances.push_back(instance);
         }
@@ -1264,6 +1313,11 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit          = */ params.fit,
                 /* .git_margin   = */ params.fit_margin,
                 /* .buft_overrides=*/ params.buft_overrides.data(),
+                /* .cpu_affinity =*/ params.cpu_affinity,
+                /* .kvarn_k      =*/ params.kvarn_k,
+                /* .kvarn_v      =*/ params.kvarn_v,
+                /* .khad        =*/ params.khad,
+                /* .vhad        =*/ params.vhad,
             };
             instances.push_back(instance);
         }
@@ -1311,6 +1365,11 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit          = */ params.fit,
                 /* .git_margin   = */ params.fit_margin,
                 /* .buft_overrides=*/ params.buft_overrides.data(),
+                /* .cpu_affinity =*/ params.cpu_affinity,
+                /* .kvarn_k      =*/ params.kvarn_k,
+                /* .kvarn_v      =*/ params.kvarn_v,
+                /* .khad        =*/ params.khad,
+                /* .vhad        =*/ params.vhad,
             };
             instances.push_back(instance);
         }
@@ -1345,6 +1404,8 @@ struct test {
     int main_gpu;
     bool no_kv_offload;
     bool flash_attn;
+    bool khad;
+    bool vhad;
     int  mla_attn;
     int  attn_max_batch;
     bool reuse;
@@ -1393,6 +1454,8 @@ struct test {
         main_gpu = inst.main_gpu;
         no_kv_offload = inst.no_kv_offload;
         flash_attn = inst.flash_attn;
+        khad = inst.khad;
+        vhad = inst.vhad;
         mla_attn = inst.mla_attn;
         attn_max_batch = inst.attn_max_batch;
         reuse = inst.reuse;
@@ -1561,6 +1624,7 @@ struct test {
             std::to_string(is_gen ? n_threads.first : n_threads.second), ggml_type_name(type_k), ggml_type_name(type_v),
             std::to_string(n_gpu_layers), split_mode_str(split_mode),
             std::to_string(main_gpu), std::to_string(no_kv_offload), std::to_string(flash_attn),
+            std::to_string(khad), std::to_string(vhad),
             std::to_string(mla_attn), std::to_string(attn_max_batch), ser_to_string(ser), std::to_string(reuse),
             tensor_split_str, std::to_string(use_mmap), std::to_string(embeddings),
             std::to_string(repack), std::to_string(mqkv), std::to_string(muge), std::to_string(defer_experts), std::to_string(fmoe), std::to_string(ger),
@@ -1584,7 +1648,7 @@ struct test {
             "n_batch", "n_ubatch",
             "n_threads", "type_k", "type_v",
             "n_gpu_layers", "split_mode",
-            "main_gpu", "no_kv_offload", "flash_attn", "mla_attn", "attn_max_batch", "ser", "reuse",
+            "main_gpu", "no_kv_offload", "flash_attn", "khad", "vhad", "mla_attn", "attn_max_batch", "ser", "reuse",
             "tensor_split", "use_mmap", "embeddings", "repack", "mqkv", "muge", "defer_experts", "fused_moe", "grouped_er",
             "no_fused_up_gate", "use_thp", "no_ooae", "rcache", "sas", "max_gpu", "cuda_params", "override_tensor",
             "n_prompt", "n_gen", "test_time",
