@@ -136,8 +136,11 @@ struct llama_kv_cache {
     // KVarN structured cache (cparams.kvarn.enabled): per-layer 128-token
     // records (I8) + F16 sink/stage. k_l/v_l stay allocated (v0 mirrors) but
     // are not consumed by the KVarN read path.
+    // ONE combined tensor per layer: k_records[il] and v_records[il] point at
+    // the same I8 [record_bytes, n_groups*n_head_kv] tensor (K and V sections
+    // share the record stride; the stores write disjoint sections).
     std::vector<struct ggml_tensor *> k_records;  // I8 [record_bytes, n_groups*n_head_kv]
-    std::vector<struct ggml_tensor *> v_records;
+    std::vector<struct ggml_tensor *> v_records;  // == k_records
     int32_t kvarn_stage_groups = 2;               // ring blocks: 1 sink + slots
     std::vector<struct ggml_tensor *> k_stage;    // F16 [head_dim, stage_groups*128, n_head_kv]
     std::vector<struct ggml_tensor *> v_stage;

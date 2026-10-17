@@ -1855,13 +1855,16 @@ static bool llama_kv_cache_init(
                             hd_k_s, LLAMA_KVARN_GROUP, cparams.kvarn.key_bits, cparams.kvarn.value_bits);
                     const int64_t n_records = n_groups * (int64_t) n_head_kv * n_slices;
 
+                    // ONE combined records tensor: a record holds the K and the V
+                    // sections back to back in the same stride; the K and the V
+                    // stores write disjoint sections of it. Separate k/v tensors
+                    // would each pay the full combined stride for one section only.
                     kr = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, (int64_t) layout.record_bytes, n_records);
-                    vr = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, (int64_t) layout.record_bytes, n_records);
+                    vr = kr;
                     ks = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hd_k_s, stage_groups*LLAMA_KVARN_GROUP, (int64_t) n_head_kv * n_slices);
                     vs = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hd_v_s, stage_groups*LLAMA_KVARN_GROUP, (int64_t) n_head_kv * n_slices);
 
-                    ggml_set_name(kr, (std::string("cache_kr_rec")   + std::to_string(i)).c_str());
-                    ggml_set_name(vr, (std::string("cache_vr_rec")   + std::to_string(i)).c_str());
+                    ggml_set_name(kr, (std::string("cache_kvarn_rec") + std::to_string(i)).c_str());
                     ggml_set_name(ks, (std::string("cache_ks_stage") + std::to_string(i)).c_str());
                     ggml_set_name(vs, (std::string("cache_vs_stage") + std::to_string(i)).c_str());
                 }
@@ -7482,6 +7485,7 @@ static void llama_debug_dump_kv_cache(llama_context & lctx, const char * dir) {
         };
         for (int i = 0; i < 4; ++i) {
             if (recs[i] == nullptr) { continue; }
+            if (i == 1 && recs[1] == recs[0]) { continue; } // combined tensor: already dumped as k_records_l0
             std::vector<uint8_t> buf(ggml_nbytes(recs[i]));
             ggml_backend_tensor_get(recs[i], buf.data(), 0, buf.size());
             std::snprintf(path, sizeof(path), "%s/%s.bin", dir, names[i]);
@@ -10380,8 +10384,13 @@ struct llama_context * llama_init_from_model(
                 LLAMA_LOG_INFO("%s: KV self dense mirrors: not allocated (KVarN structured cache)\n", __func__);
             }
             size_t memory_size_kvarn = 0;
-            for (auto & t : ctx->kv_self.k_records) { if (t) memory_size_kvarn += ggml_nbytes(t); }
-            for (auto & t : ctx->kv_self.v_records) { if (t) memory_size_kvarn += ggml_nbytes(t); }
+            for (size_t il = 0; il < ctx->kv_self.k_records.size(); ++il) {
+                // k_records/v_records share one combined tensor per layer
+                const struct ggml_tensor * tkr = ctx->kv_self.k_records[il];
+                if (tkr) { memory_size_kvarn += ggml_nbytes(tkr); }
+                const struct ggml_tensor * tvr = il < ctx->kv_self.v_records.size() ? ctx->kv_self.v_records[il] : nullptr;
+                if (tvr && tvr != tkr) { memory_size_kvarn += ggml_nbytes(tvr); }
+            }
             for (auto & t : ctx->kv_self.k_stage)   { if (t) memory_size_kvarn += ggml_nbytes(t); }
             for (auto & t : ctx->kv_self.v_stage)   { if (t) memory_size_kvarn += ggml_nbytes(t); }
             if (memory_size_kvarn > 0) {
