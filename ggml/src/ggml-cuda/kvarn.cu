@@ -216,16 +216,19 @@ static __global__ void kvarn_pv_records_kernel(
 // ---------------------------------------------------------------------------
 
 static __device__ float kvarn_std(const float * __restrict__ v, const int n, const int stride) {
-    float sum    = 0.0f;
-    float sum_sq = 0.0f;
+    // double accumulation: mirrors the CPU reference (kvarn_std_stride) and
+    // avoids the catastrophic sum_sq - n*mean^2 cancellation in float on
+    // massive-activation tiles (which sent the Sinkhorn down bad paths)
+    double sum    = 0.0;
+    double sum_sq = 0.0;
     for (int i = 0; i < n; ++i) {
-        const float x = v[size_t(i) * stride];
+        const double x = v[size_t(i) * stride];
         sum    += x;
         sum_sq += x * x;
     }
-    const float mean = sum / n;
-    const float var  = fmaxf(0.0f, (sum_sq - float(n) * mean * mean) / float(n > 1 ? n - 1 : 1));
-    return sqrtf(var);
+    const double mean = sum / n;
+    const double var  = fmax(0.0, (sum_sq - double(n) * mean * mean) / double(n > 1 ? n - 1 : 1));
+    return float(sqrt(var));
 }
 
 static __device__ __forceinline__ void kvarn_put_f16(uint8_t * __restrict__ rec, size_t off, int i, float v) {
@@ -310,14 +313,14 @@ static __device__ void kvarn_store_tile_quantize(
     for (int it = 0; it < iters; ++it) {
         // column pass: std over rows of cur[r][c] = tile[r][c]/(e_row[r]*e_col[c])
         if (tid < cols) {
-            float sum = 0.0f, sum_sq = 0.0f;
+            double sum = 0.0, sum_sq = 0.0;
             for (int r = 0; r < rows; ++r) {
-                const float x = tile[size_t(r) * cols + tid] / e_row[r];
+                const double x = tile[size_t(r) * cols + tid] / e_row[r];
                 sum += x; sum_sq += x * x;
             }
-            const float mean = sum / rows;
-            const float var  = fmaxf(0.0f, (sum_sq - float(rows) * mean * mean) / float(rows > 1 ? rows - 1 : 1));
-            const float std  = sqrtf(var) / e_col[tid];
+            const double mean = sum / rows;
+            const double var  = fmax(0.0, (sum_sq - double(rows) * mean * mean) / double(rows > 1 ? rows - 1 : 1));
+            const float std   = float(sqrt(var)) / e_col[tid];
             const float s    = fminf(fmaxf(std, 1e-3f), 1e3f);
             l_col[tid] = fminf(fmaxf(l_col[tid] + logf(s), -0.3f), 10.0f);
         }
@@ -328,14 +331,14 @@ static __device__ void kvarn_store_tile_quantize(
         // row pass
         if (tid < rows) {
             const float * row = tile + size_t(tid) * cols;
-            float sum = 0.0f, sum_sq = 0.0f;
+            double sum = 0.0, sum_sq = 0.0;
             for (int c = 0; c < cols; ++c) {
-                const float x = row[c] / e_col[c];
+                const double x = row[c] / e_col[c];
                 sum += x; sum_sq += x * x;
             }
-            const float mean = sum / cols;
-            const float var  = fmaxf(0.0f, (sum_sq - float(cols) * mean * mean) / float(cols > 1 ? cols - 1 : 1));
-            const float std  = sqrtf(var) / e_row[tid];
+            const double mean = sum / cols;
+            const double var  = fmax(0.0, (sum_sq - double(cols) * mean * mean) / double(cols > 1 ? cols - 1 : 1));
+            const float std   = float(sqrt(var)) / e_row[tid];
             const float s    = fminf(fmaxf(std, 1e-3f), 1e3f);
             l_row[tid] = fminf(fmaxf(l_row[tid] + logf(s), -0.3f), 10.0f);
         }
@@ -345,25 +348,25 @@ static __device__ void kvarn_store_tile_quantize(
 
         // imbalance of the current normalization; keep best-so-far scales
         if (tid < cols) {
-            float sum = 0.0f, sum_sq = 0.0f;
+            double sum = 0.0, sum_sq = 0.0;
             for (int r = 0; r < rows; ++r) {
-                const float x = tile[size_t(r) * cols + tid] / e_row[r];
+                const double x = tile[size_t(r) * cols + tid] / e_row[r];
                 sum += x; sum_sq += x * x;
             }
-            const float mean = sum / rows;
-            const float var  = fmaxf(0.0f, (sum_sq - float(rows) * mean * mean) / float(rows > 1 ? rows - 1 : 1));
-            s_col[tid] = sqrtf(var) / e_col[tid];
+            const double mean = sum / rows;
+            const double var  = fmax(0.0, (sum_sq - double(rows) * mean * mean) / double(rows > 1 ? rows - 1 : 1));
+            s_col[tid] = float(sqrt(var)) / e_col[tid];
         }
         if (tid < rows) {
             const float * row = tile + size_t(tid) * cols;
-            float sum = 0.0f, sum_sq = 0.0f;
+            double sum = 0.0, sum_sq = 0.0;
             for (int c = 0; c < cols; ++c) {
-                const float x = row[c] / e_col[c];
+                const double x = row[c] / e_col[c];
                 sum += x; sum_sq += x * x;
             }
-            const float mean = sum / cols;
-            const float var  = fmaxf(0.0f, (sum_sq - float(cols) * mean * mean) / float(cols > 1 ? cols - 1 : 1));
-            s_row[tid] = sqrtf(var) / e_row[tid];
+            const double mean = sum / cols;
+            const double var  = fmax(0.0, (sum_sq - double(cols) * mean * mean) / double(cols > 1 ? cols - 1 : 1));
+            s_row[tid] = float(sqrt(var)) / e_row[tid];
         }
         __syncthreads();
         kvarn_imb_reduce(s_col, s_row, rows, cols, s_imb);
@@ -1279,6 +1282,7 @@ static void kvarn_dump_dev(const void * dev, size_t bytes, const char * name, cu
     // (KVarN kernels participate in CUDA graph captures)
     cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
     if (cudaStreamIsCapturing(stream, &cap) == cudaSuccess && cap != cudaStreamCaptureStatusNone) {
+        fprintf(stderr, "[kvarn dump] capturing (%d), skipped %s\n", (int) cap, name);
         return;
     }
     char path[1024];
@@ -1396,6 +1400,20 @@ static void kvarn_store2_op(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             kD, H, k_rows, slots, n_record_groups, n_slices, false, bits, iters, alpha, stream);
     ggml_cuda_kvarn_seal(&v_layout, v_stage->data, v_rec->data, st,
             vD, H, v_rows, slots, n_record_groups, n_slices, true, other, iters, alpha, stream);
+
+    // debug dump hooks (mirror the single-side store): the seal's inputs (the
+    // stages) and outputs (the records) of this call
+    static int dbg_store2 = 0;
+    if (kvarn_dump_range("IK_KVARN_DUMP_STORE_FROM", "IK_KVARN_DUMP_STORE_TO", dbg_store2)) {
+        char name[64];
+        snprintf(name, sizeof(name), "s2_%03d_k_stage", dbg_store2);
+        kvarn_dump_dev(k_stage->data, ggml_nbytes(k_stage), name, stream);
+        snprintf(name, sizeof(name), "s2_%03d_v_stage", dbg_store2);
+        kvarn_dump_dev(v_stage->data, ggml_nbytes(v_stage), name, stream);
+        snprintf(name, sizeof(name), "s2_%03d_krec", dbg_store2);
+        kvarn_dump_dev(k_rec->data, ggml_nbytes(k_rec), name, stream);
+    }
+    ++dbg_store2;
 
     // 2. one launch writes both stages
     ggml_cuda_kvarn_stage_write2((const float *) k_cur->data, (const float *) v_cur->data,
