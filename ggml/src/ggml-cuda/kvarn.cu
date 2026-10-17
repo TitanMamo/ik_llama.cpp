@@ -1232,7 +1232,8 @@ __global__ void kvarn_attn_kernel(
         }
         __syncthreads();
     }
-    const float mx = red[0];
+    __threadfence_block();
+    const float mx = *((volatile float *) red); // volatile: defeat barrier-interval rescheduling
     __syncthreads();
 
     // phase 2b: exp + sum, probabilities in place
@@ -1251,7 +1252,9 @@ __global__ void kvarn_attn_kernel(
         }
         __syncthreads();
     }
-    const float inv_sum = red[0] > 0.0f ? 1.0f / red[0] : 0.0f;
+    __threadfence_block();
+    const float red_sum = *((volatile float *) red);
+    const float inv_sum = red_sum > 0.0f ? 1.0f / red_sum : 0.0f;
 
     // phase 3: PV, one thread per output channel (full head width; loops for Dv > blockDim)
     for (int dow = tid; dow < Dv; dow += blockDim.x) {
