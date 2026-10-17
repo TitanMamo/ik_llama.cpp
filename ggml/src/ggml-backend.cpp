@@ -1548,6 +1548,26 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                 //}
             }
         }
+        // KVarN cache ops (KVARN_STORE/MATERIALIZE/ATTN) mutate their
+        // stage/records tensors in place; they must run on the backend that
+        // owns those tensors. Left to the expansion passes, a GPU backend
+        // stretches over them (they are "supported") and reads/writes
+        // scheduler-made copies of the cache, so every cache update is lost.
+        if (*node_backend_id == -1) {
+            int cache_src = -1;
+            switch (node->op) {
+                case GGML_OP_KVARN_STORE:       cache_src = node->op_params[9] != 0 ? 3 : 2; break;
+                case GGML_OP_KVARN_MATERIALIZE: cache_src = 0; break;
+                case GGML_OP_KVARN_ATTN:        cache_src = 1; break;
+                default: break;
+            }
+            if (cache_src >= 0 && node->src[cache_src] != NULL) {
+                const int src_backend_id = tensor_backend_id(node->src[cache_src]);
+                if (src_backend_id != -1) {
+                    *node_backend_id = src_backend_id;
+                }
+            }
+        }
         // do not overwrite user assignments
         if (*node_backend_id == -1) {
             *node_backend_id = ggml_backend_sched_backend_id_from_cur(sched, node);
