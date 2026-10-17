@@ -215,6 +215,12 @@ static __global__ void kvarn_pv_records_kernel(
 // results can differ from the CPU only at RTN rounding boundaries.
 // ---------------------------------------------------------------------------
 
+__device__ int g_kvarn_sink_dbg = 0; // set by test harnesses to trace the sinkhorn
+
+extern "C" void ggml_cuda_kvarn_set_sink_dbg(int v) {
+    cudaMemcpyToSymbol(g_kvarn_sink_dbg, &v, sizeof(int));
+}
+
 static __device__ float kvarn_std(const float * __restrict__ v, const int n, const int stride) {
     // double accumulation: mirrors the CPU reference (kvarn_std_stride) and
     // avoids the catastrophic sum_sq - n*mean^2 cancellation in float on
@@ -313,14 +319,16 @@ static __device__ void kvarn_store_tile_quantize(
     for (int it = 0; it < iters; ++it) {
         // column pass: std over rows of cur[r][c] = tile[r][c]/(e_row[r]*e_col[c])
         if (tid < cols) {
+            // x = tile[r][c] / (e_row[r] * e_col[c]), one rounded division per
+            // element exactly like the CPU reference's cur rebuild
             double sum = 0.0, sum_sq = 0.0;
             for (int r = 0; r < rows; ++r) {
-                const double x = tile[size_t(r) * cols + tid] / e_row[r];
+                const double x = tile[size_t(r) * cols + tid] / (e_col[tid] * e_row[r]);
                 sum += x; sum_sq += x * x;
             }
             const double mean = sum / rows;
             const double var  = fmax(0.0, (sum_sq - double(rows) * mean * mean) / double(rows > 1 ? rows - 1 : 1));
-            const float std   = float(sqrt(var)) / e_col[tid];
+            const float std   = float(sqrt(var));
             const float s    = fminf(fmaxf(std, 1e-3f), 1e3f);
             l_col[tid] = fminf(fmaxf(l_col[tid] + logf(s), -0.3f), 10.0f);
         }
@@ -333,12 +341,12 @@ static __device__ void kvarn_store_tile_quantize(
             const float * row = tile + size_t(tid) * cols;
             double sum = 0.0, sum_sq = 0.0;
             for (int c = 0; c < cols; ++c) {
-                const double x = row[c] / e_col[c];
+                const double x = row[c] / (e_col[c] * e_row[tid]);
                 sum += x; sum_sq += x * x;
             }
             const double mean = sum / cols;
             const double var  = fmax(0.0, (sum_sq - double(cols) * mean * mean) / double(cols > 1 ? cols - 1 : 1));
-            const float std   = float(sqrt(var)) / e_row[tid];
+            const float std   = float(sqrt(var));
             const float s    = fminf(fmaxf(std, 1e-3f), 1e3f);
             l_row[tid] = fminf(fmaxf(l_row[tid] + logf(s), -0.3f), 10.0f);
         }
@@ -350,34 +358,44 @@ static __device__ void kvarn_store_tile_quantize(
         if (tid < cols) {
             double sum = 0.0, sum_sq = 0.0;
             for (int r = 0; r < rows; ++r) {
-                const double x = tile[size_t(r) * cols + tid] / e_row[r];
+                const double x = tile[size_t(r) * cols + tid] / (e_col[tid] * e_row[r]);
                 sum += x; sum_sq += x * x;
             }
             const double mean = sum / rows;
             const double var  = fmax(0.0, (sum_sq - double(rows) * mean * mean) / double(rows > 1 ? rows - 1 : 1));
-            s_col[tid] = float(sqrt(var)) / e_col[tid];
+            s_col[tid] = float(sqrt(var));
         }
         if (tid < rows) {
             const float * row = tile + size_t(tid) * cols;
             double sum = 0.0, sum_sq = 0.0;
             for (int c = 0; c < cols; ++c) {
-                const double x = row[c] / e_col[c];
+                const double x = row[c] / (e_col[c] * e_row[tid]);
                 sum += x; sum_sq += x * x;
             }
             const double mean = sum / cols;
             const double var  = fmax(0.0, (sum_sq - double(cols) * mean * mean) / double(cols > 1 ? cols - 1 : 1));
-            s_row[tid] = float(sqrt(var)) / e_row[tid];
+            s_row[tid] = float(sqrt(var));
         }
         __syncthreads();
         kvarn_imb_reduce(s_col, s_row, rows, cols, s_imb);
         // All threads derive the same decision from the same s_imb and their
-        // own (identically updated) register copy of the best imbalance, so no
-        // shared flag is handed across a barrier. The previous shared-flag
-        // version was miscompiled by nvcc 12.4: non-zero threads' flag read was
-        // scheduled into the same barrier interval as thread 0's write, before
-        // it, making the seal nondeterministic.
-        const bool keep = (*s_imb <= imb_best);
-        if (keep) { imb_best = *s_imb; }
+        // own (identically updated) register copy of the best imbalance. The
+        // read is forced through a volatile load after an explicit block fence:
+        // nvcc schedules plain shared reads across the trailing barrier of the
+        // reduce for some threads, which made a few threads read the previous
+        // iteration's (or the pre-loop) imbalance and keep a stale, degenerate
+        // set of scales while the rest of the block did not.
+        __threadfence_block();
+        const float imb_cur = *((volatile float *) s_imb);
+        __threadfence_block();
+        const bool keep = (imb_cur <= imb_best);
+        if (g_kvarn_sink_dbg && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
+            printf("[sink it%d] imb=%.9g best(before)=%.9g keep=%d l_col[0..3]=%.6g,%.6g,%.6g,%.6g e_row[0..2]=%.6g,%.6g,%.6g\n",
+                    it, (double)*s_imb, (double)imb_best, (int)keep,
+                    (double)l_col[0], (double)l_col[1], (double)l_col[2], (double)l_col[3],
+                    (double)e_row[0], (double)e_row[1], (double)e_row[2]);
+        }
+        if (keep) { imb_best = imb_cur; }
         __syncthreads();
         if (keep) {
             if (tid < rows) { b_row[tid] = e_row[tid]; }
@@ -386,6 +404,12 @@ static __device__ void kvarn_store_tile_quantize(
         __syncthreads();
     }
 
+    if (g_kvarn_sink_dbg && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
+        printf("[sink final] b_col[0..3]=%.6g,%.6g,%.6g,%.6g b_row[0..2]=%.6g,%.6g,%.6g\n",
+                (double)b_col[0], (double)b_col[1], (double)b_col[2], (double)b_col[3],
+                (double)b_row[0], (double)b_row[1], (double)b_row[2]);
+    }
+    __syncthreads();
     // optional VarN damping: stored scales are s**alpha (alpha=1 = reference)
     if (alpha != 1.0f) {
         if (tid < rows) { b_row[tid] = powf(b_row[tid], alpha); }
