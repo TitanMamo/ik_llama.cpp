@@ -19,6 +19,7 @@ typedef void (* fattn_kernel_mma_t)(
         const char * __restrict__ V,
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
+        const char * __restrict__ key_scale,
         const int2 * __restrict__ bounds,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
@@ -140,6 +141,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const half2  * const __restrict__ K_h2,
         const half2  * const __restrict__ V_h2,
         const half2  * const __restrict__ mask_h2,
+        const char   * const __restrict__ key_scale,
         float2       * const __restrict__ dstk,
         float2       * const __restrict__ dstk_fixup,
         const float scale,
@@ -228,6 +230,19 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     float KQ_rowsum_add[cols_per_thread] = {0.0f};
 
     if (ntiles == 1) {
+        if (key_scale != nullptr) {
+            // per-key score scale (K-cache token normalization): the stored K rows
+            // were divided by s_t, so the true score is s_t * (q . k')
+#pragma unroll
+            for (int i00 = 0; i00 < KQ_per_iter; i00 += np*tile_C_KQ::I) {
+                const int i0 = i00 + (threadIdx.y % np)*tile_C_KQ::I;
+#pragma unroll
+                for (int l = 0; l < tile_C_KQ::ne; ++l) {
+                    const int i = i0 + tile_C_KQ::get_i(l);
+                    KQ_C[i00/(np*tile_C_KQ::I)].x[l] *= ((const float *) key_scale)[k_VKQ_0 + i];
+                }
+            }
+        }
         if (ncols2 > 1 || mask_h2) {
 #pragma unroll
             for (int i00 = 0; i00 < KQ_per_iter; i00 += np*tile_C_KQ::I) {
@@ -275,6 +290,23 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
         }
     } else { // ntiles > 1
+        if (key_scale != nullptr) {
+            // per-key score scale, half2 tiles (keys 2i, 2i+1 share the mask word)
+#pragma unroll
+            for (int i00 = 0; i00 < KQ_per_iter; i00 += np*tile_C_KQ_16::J) {
+                const int i0 = i00 + (threadIdx.y % np)*tile_C_KQ_16::J;
+#pragma unroll
+                for (int t = 0; t < ntiles/2; ++t) {
+#pragma unroll
+                    for (int l0 = 0; l0 < tile_C_KQ_16::ne; l0 += 2) {
+                        const int i = (i0 + tile_C_KQ_16::get_j(l0)) / 2;
+                        const int KQ_index = i00/(np*tile_C_KQ_16::J) * ntiles/2 + t;
+                        KQ_C_16[KQ_index].x[l0 + 0] *= ((const float *) key_scale)[k_VKQ_0 + 2*i + 0];
+                        KQ_C_16[KQ_index].x[l0 + 1] *= ((const float *) key_scale)[k_VKQ_0 + 2*i + 1];
+                    }
+                }
+            }
+        }
         if (ncols2 > 1 || mask_h2) {
 #pragma unroll
             for (int i00 = 0; i00 < KQ_per_iter; i00 += np*tile_C_KQ_16::J) {
@@ -450,6 +482,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const half2  * const __restrict__ K_h2,
         const half2  * const __restrict__ V_h2,
         const half2  * const __restrict__ mask_h2,
+        const char   * const __restrict__ key_scale,
         const float  * const __restrict__ sinks_f,
         float2       * const __restrict__ dstk,
         float2       * const __restrict__ dstk_fixup,
@@ -579,13 +612,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     for (int kb0 = kb0_start; kb0 < kb0_stop-1; ++kb0) {
         constexpr bool last_iter = false;
         flash_attn_ext_f16_iter<D, ncols1, ncols2, nwarps, KQ_per_iter, ntiles, use_logit_softcap, needs_fixup, is_fixup, last_iter>
-            (Q_f2, K_h2, V_h2, mask_h2, dstk, dstk_fixup, scale, slope, logit_softcap, fa_offset,
+            (Q_f2, K_h2, V_h2, mask_h2, key_scale, dstk, dstk_fixup, scale, slope, logit_softcap, fa_offset,
              ne01, ne02, stride_KV, stride_mask, jt, tile_K, tile_V, tile_mask, Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0);
     }
     { // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
         constexpr bool last_iter = true;
         flash_attn_ext_f16_iter<D, ncols1, ncols2, nwarps, KQ_per_iter, ntiles, use_logit_softcap, needs_fixup, is_fixup, last_iter>
-            (Q_f2, K_h2, V_h2, mask_h2, dstk, dstk_fixup, scale, slope, logit_softcap, fa_offset,
+            (Q_f2, K_h2, V_h2, mask_h2, key_scale, dstk, dstk_fixup, scale, slope, logit_softcap, fa_offset,
              ne01, ne02, stride_KV, stride_mask, jt, tile_K, tile_V, tile_mask, Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0_stop-1);
     }
 
@@ -897,6 +930,7 @@ static __global__ void flash_attn_mma_ext_f16(
         const char * __restrict__ V,
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
+        const char * __restrict__ key_scale,
         const int2 * __restrict__ bounds,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
@@ -972,12 +1006,12 @@ static __global__ void flash_attn_mma_ext_f16(
         if (kb0_start == 0) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<D, ncols1, ncols2, nwarps, KQ_per_iter, ntiles, use_logit_softcap, needs_fixup, is_fixup>
-                (Q_f2, K_h2, V_h2, mask_h2, sinks_f, dstk, dst_meta, scale, slope, logit_softcap, fa_offset,
+                (Q_f2, K_h2, V_h2, mask_h2, key_scale, sinks_f, dstk, dst_meta, scale, slope, logit_softcap, fa_offset,
                  ne01, ne02, stride_Q1, stride_Q2, stride_KV, stride_mask, jt, kb0_start_kernel, kb0_stop_kernel);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is working on the beginning of a tile.
             flash_attn_ext_f16_process_tile<D, ncols1, ncols2, nwarps, KQ_per_iter, ntiles, use_logit_softcap, needs_fixup, is_fixup>
-                (Q_f2, K_h2, V_h2, mask_h2, sinks_f, dstk, dst_meta, scale, slope, logit_softcap, fa_offset,
+                (Q_f2, K_h2, V_h2, mask_h2, key_scale, sinks_f, dstk, dst_meta, scale, slope, logit_softcap, fa_offset,
                  ne01, ne02, stride_Q1, stride_Q2, stride_KV, stride_mask, jt, kb0_start_kernel, kb0_stop_kernel);
         }
 
@@ -1014,7 +1048,7 @@ static __global__ void flash_attn_mma_ext_f16(
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     constexpr bool needs_fixup = false;
     flash_attn_ext_f16_process_tile<D, ncols1, ncols2, nwarps, KQ_per_iter, ntiles, use_logit_softcap, needs_fixup, is_fixup>
-        (Q_f2, K_h2, V_h2, mask_h2, sinks_f, dstk, dst_meta, scale, slope, logit_softcap, fa_offset,
+        (Q_f2, K_h2, V_h2, mask_h2, key_scale, sinks_f, dstk, dst_meta, scale, slope, logit_softcap, fa_offset,
          ne01, ne02, stride_Q1, stride_Q2, stride_KV, stride_mask, jt, kb0_start_kernel, kb0_stop_kernel);
 #else
     GGML_UNUSED(Q); GGML_UNUSED(K); GGML_UNUSED(V); GGML_UNUSED(mask); GGML_UNUSED(sinks);
@@ -1278,6 +1312,7 @@ void launch_fattn_mma(
 
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * key_scale = dst->src[6];
 
     ggml_tensor * KQV = dst;
 
@@ -1456,6 +1491,7 @@ void launch_fattn_mma(
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *)sinks->data) : nullptr,
+        key_scale ? ((const char *)key_scale->data) : nullptr,
         KV_min_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, logit_softcap, ctx.fa_offset, n_head_log2,

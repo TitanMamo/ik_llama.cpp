@@ -864,7 +864,25 @@ bool llama_context::update_cache_copies() {
             }
         }
     }
-    return patch_dsa_cache_copies();
+    auto patch_ktn_cache_copies = [&]() -> bool {
+        // K-cache token normalization: patch the per-layer log-RMS write offset for
+        // reused graphs (step = one F16 per token). The mask-side read covers the
+        // same cache rows, so only the write needs re-pointing.
+        for (size_t il = 0; il < ktn_cache_copies.size(); ++il) {
+            auto & c = ktn_cache_copies[il];
+            if (!c.cpy) continue;
+            if (c.cpy->op != GGML_OP_CPY ||
+                il >= kv_self.ktn_l.size() || kv_self.ktn_l[il] == nullptr ||
+                c.cpy->view_src != kv_self.ktn_l[il]) {
+                return false;
+            }
+            c.cpy->view_offs    = kv_self.head * c.step;
+            c.cpy->src[1]->data = (char *) kv_self.ktn_l[il]->data + c.cpy->view_offs;
+            c.cpy->data         = c.cpy->src[1]->data;
+        }
+        return true;
+    };
+    return patch_dsa_cache_copies() && patch_ktn_cache_copies();
 }
 
 // KVarN graph reuse: a reused graph must see this call's group state. Patch
@@ -976,6 +994,7 @@ llama_context::llama_context(const llama_model & model)
     // DSA indexer-key cache copy. Entries stay null for non-DSA models and non-indexer layers,
     // so update_cache_copies() is a no-op when DSA is off.
     dsa_cache_copies.resize(hparams.n_layer);
+    ktn_cache_copies.resize(hparams.n_layer);
     openpangu_cache_copies.resize(hparams.n_layer);
     openpangu_cache_copies_mtp.resize(hparams.n_layer);
     llama_all_contexts().push_back(this);
@@ -1530,6 +1549,10 @@ static bool llama_kv_cache_init(
     if (has_glm_dsa_indexer || has_openpangu_dsa_indexer || has_qwen4exp_indexer) {
         cache.kr_l.resize(n_layer, nullptr);
     }
+    if (cparams.k_cache_token_norm) {
+        cache.ktn = true;
+        cache.ktn_l.resize(n_layer, nullptr);
+    }
     if (has_qwen4exp_indexer) {
         cache.kp_l.resize(n_layer, nullptr);
     }
@@ -1762,6 +1785,14 @@ static bool llama_kv_cache_init(
                         (cache.rows(i) + ratio - 1)/ratio);
                 ggml_format_name(idxp, "cache_kp_l%d", i);
                 cache.kp_l[i] = idxp;
+            }
+
+            if (cparams.k_cache_token_norm) {
+                // per-token K scale s_t (RMS of the stored row); the FA multiplies
+                // the scores by it, restoring the exact attention
+                ggml_tensor * ktn = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cache.rows(i));
+                ggml_format_name(ktn, "cache_ktn_l%d", i);
+                cache.ktn_l[i] = ktn;
             }
 
             auto k_name = std::string{"cache_k_l"} + std::to_string(i);
@@ -3091,6 +3122,12 @@ static void llama_kv_cache_defrag(struct llama_kv_cache & cache) {
         // the structured cache is position-indexed: records have no per-cell
         // rows to move; skipping is safe (defrag is an optimization)
         LLAMA_LOG_WARN("%s: defrag is not supported with a KVarN structured cache - skipping\n", __func__);
+        return;
+    }
+    if (cache.ktn) {
+        // the per-token log-scale rows are indexed by cache cell; moving cells
+        // without moving them would desync - skipping is safe
+        LLAMA_LOG_WARN("%s: defrag is not supported with K-cache token normalization - skipping\n", __func__);
         return;
     }
     cache.do_defrag = true;
@@ -9327,6 +9364,7 @@ struct llama_context_params llama_context_default_params() {
         /*.prefetch_experts_threads    =*/ 0,
         /*.k_cache_hadamard            =*/ false,
         /*.v_cache_hadamard            =*/ false,
+        /*.k_cache_token_norm          =*/ false,
         /*.split_mode_graph_scheduling =*/ false,
         // /*.split_mode_f16           =*/ true,
         /*.scheduler_async             =*/ false,
@@ -9846,6 +9884,34 @@ struct llama_context * llama_init_from_model(
         }
     }
 
+    if (params.k_cache_token_norm) {
+        if (params.kvarn.enabled) {
+            LLAMA_LOG_WARN("%s: K-cache token normalization is not used with the KVarN structured cache. Turning off\n", __func__);
+            params.k_cache_token_norm = false;
+        } else if (!ggml_is_quantized(params.type_k)) {
+            LLAMA_LOG_WARN("%s: there is no point in K-cache token normalization with a not quantized K-cache. Turning off\n", __func__);
+            params.k_cache_token_norm = false;
+        } else if (!params.flash_attn) {
+            LLAMA_LOG_WARN("%s: K-cache token normalization requires flash attention (the per-key scale is applied to the attention scores in FA). Turning off\n", __func__);
+            params.k_cache_token_norm = false;
+        } else if (model->hparams.attn_soft_cap) {
+            LLAMA_LOG_WARN("%s: K-cache token normalization is not implemented with logit soft-capping. Turning off\n", __func__);
+            params.k_cache_token_norm = false;
+        } else if (model->splits.size() > 1) {
+            LLAMA_LOG_WARN("%s: K-cache token normalization is not implemented with multi-device splits. Turning off\n", __func__);
+            params.k_cache_token_norm = false;
+        } else {
+            bool has_swa = false;
+            for (int il = 0; il < model->hparams.n_layer && !has_swa; ++il) {
+                has_swa = model->hparams.swa_layers[il] != 0;
+            }
+            if (has_swa) {
+                LLAMA_LOG_WARN("%s: K-cache token normalization is not implemented with sliding-window attention. Turning off\n", __func__);
+                params.k_cache_token_norm = false;
+            }
+        }
+    }
+
     llama_context * ctx = new llama_context(*model);
 
     // add devices to ctx->cparams from model
@@ -9900,6 +9966,7 @@ struct llama_context * llama_init_from_model(
     }
     cparams.prefetch_experts = params.prefetch_experts;
     cparams.k_cache_hadamard = params.k_cache_hadamard;
+    cparams.k_cache_token_norm = params.k_cache_token_norm;
     cparams.v_cache_hadamard = params.v_cache_hadamard;
     cparams.kvarn            = params.kvarn;
     // Folding H into wv_b/wk_b_pp permanently mutates the model; a later context
@@ -11478,10 +11545,10 @@ void llama_spec_ckpt_discard(struct llama_context * ctx) {
 }
 
 bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    if (ctx->cparams.kvarn.enabled && !(p0 < 0 && p1 < 0)) {
+    if ((ctx->cparams.kvarn.enabled || ctx->cparams.k_cache_token_norm) && !(p0 < 0 && p1 < 0)) {
         // v1 contract: one contiguous token stream; only the full clear is
-        // supported (a partial removal would rewind into the sealed records)
-        LLAMA_LOG_ERROR("%s: partial seq_rm is not supported with a KVarN structured cache; use a full clear\n", __func__);
+        // supported (a partial removal would rewind into sealed records / stale scales)
+        LLAMA_LOG_ERROR("%s: partial seq_rm is not supported with a KVarN structured cache or K-cache token normalization; use a full clear\n", __func__);
         return false;
     }
     const bool result = llama_kv_cache_seq_rm(ctx->kv_self, seq_id, p0, p1);
@@ -11497,8 +11564,8 @@ bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llam
 }
 
 void llama_kv_cache_seq_cp(struct llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
-    if (ctx->cparams.kvarn.enabled) {
-        LLAMA_LOG_ERROR("%s: seq_cp is not supported with a KVarN structured cache (one contiguous stream, v1)\n", __func__);
+    if (ctx->cparams.kvarn.enabled || ctx->cparams.k_cache_token_norm) {
+        LLAMA_LOG_ERROR("%s: seq_cp is not supported with a KVarN structured cache or K-cache token normalization (one contiguous stream, v1)\n", __func__);
         return;
     }
     if (seq_id_src == seq_id_dst) {
@@ -11511,16 +11578,16 @@ void llama_kv_cache_seq_cp(struct llama_context * ctx, llama_seq_id seq_id_src, 
 }
 
 void llama_kv_cache_seq_keep(struct llama_context * ctx, llama_seq_id seq_id) {
-    if (ctx->cparams.kvarn.enabled) {
-        LLAMA_LOG_ERROR("%s: seq_keep is not supported with a KVarN structured cache (one contiguous stream, v1)\n", __func__);
+    if (ctx->cparams.kvarn.enabled || ctx->cparams.k_cache_token_norm) {
+        LLAMA_LOG_ERROR("%s: seq_keep is not supported with a KVarN structured cache or K-cache token normalization (one contiguous stream, v1)\n", __func__);
         return;
     }
     llama_kv_cache_seq_keep(ctx->kv_self, seq_id);
 }
 
 void llama_kv_cache_seq_add(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
-    if (ctx->cparams.kvarn.enabled) {
-        LLAMA_LOG_ERROR("%s: seq_add (position shift) is not supported with a KVarN structured cache (v1)\n", __func__);
+    if (ctx->cparams.kvarn.enabled || ctx->cparams.k_cache_token_norm) {
+        LLAMA_LOG_ERROR("%s: seq_add (position shift) is not supported with a KVarN structured cache or K-cache token normalization (v1)\n", __func__);
         return;
     }
     if (delta == 0) {
@@ -11531,8 +11598,8 @@ void llama_kv_cache_seq_add(struct llama_context * ctx, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache_seq_div(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
-    if (ctx->cparams.kvarn.enabled) {
-        LLAMA_LOG_ERROR("%s: seq_div (position division) is not supported with a KVarN structured cache (v1)\n", __func__);
+    if (ctx->cparams.kvarn.enabled || ctx->cparams.k_cache_token_norm) {
+        LLAMA_LOG_ERROR("%s: seq_div (position division) is not supported with a KVarN structured cache or K-cache token normalization (v1)\n", __func__);
         return;
     }
     if (d == 1) {
@@ -13408,8 +13475,8 @@ static bool llama_state_io_supported(
         LLAMA_LOG_ERROR("%s: only per-sequence state save/restore is supported for openPangu (whole-context and file-session state are not)\n", func);
         return false;
     }
-    if (ctx->cparams.kvarn.enabled) {
-        LLAMA_LOG_ERROR("%s: KV state save/restore is not supported with a KVarN structured cache yet\n", func);
+    if (ctx->cparams.kvarn.enabled || ctx->cparams.k_cache_token_norm) {
+        LLAMA_LOG_ERROR("%s: KV state save/restore is not supported with a KVarN structured cache or K-cache token normalization yet\n", func);
         return false;
     }
     if (ctx->kv_self.any_compacted() && seq_id < 0) {

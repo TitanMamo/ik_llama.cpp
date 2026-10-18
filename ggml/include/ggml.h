@@ -2747,6 +2747,12 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // per-key scale applied to the attention scores (K-cache token normalization:
+    // the stored K rows are divided by s_t, so the true score is s_t * (q . k'))
+    GGML_API void ggml_flash_attn_ext_add_key_scale(
+            struct ggml_tensor * a,
+            struct ggml_tensor * key_scale);
+
     // Latent attention over a packed K/V cache with an independently-visible K/V prefix.
     // The value vector of cache row n is cache[dv_off .. dv_off+dv, n] (MLA "absorbed"
     // layout: openPangu packs [ckv|k_pe] -> dv_off=0; DeepSeek/GLM_DSA packs [k_pe|ckv]

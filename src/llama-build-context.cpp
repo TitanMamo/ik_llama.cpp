@@ -2411,6 +2411,13 @@ static ggml_tensor * llm_build_kqv(
                     hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
             cb(cur, "fa", il);
             ggml_flash_attn_ext_add_sinks(cur, sinks);
+            if (cparams.k_cache_token_norm && !cparams.kvarn.enabled &&
+                (size_t) kv_layer < kv.ktn_l.size() && kv.ktn_l[kv_layer] != nullptr) {
+                // per-key score scale: the store divided the K rows by s_t; multiplying
+                // the scores by s_t restores the exact attention with normalized keys
+                ggml_tensor * ks = ggml_view_1d(ctx, kv.ktn_l[kv_layer], n_kv, (size_t) kv_view_offset*sizeof(float));
+                ggml_flash_attn_ext_add_key_scale(cur, ks);
+            }
             if (n_swa > 0 && !kv.cells_disordered) {
                 ((int32_t *)cur->op_params)[4] = n_swa;
             }
@@ -2608,6 +2615,29 @@ ggml_tensor * llm_build_context::llm_build_kv(
         if (int block_size = lctx.model.hadamard_size_v(il); block_size > 0) {
             v_cur = ggml_hadamard(ctx, v_cur, block_size);
         }
+    }
+
+    if (cparams.k_cache_token_norm && k_cur != nullptr && !cparams.kvarn.enabled &&
+        (size_t) il < kv.ktn_l.size() && kv.ktn_l[il] != nullptr) {
+        // per-token K normalization (the KVarN token-scale fold, online): the
+        // stored keys are divided by the token's row RMS and the RMS is written
+        // to the per-layer scale cache; the FA multiplies each score by the
+        // key's RMS, so s_t * (q . k') == (q . k) restores the exact attention
+        // while the quantizer sees normalized rows.
+        const int64_t n_kn = (int64_t) hparams.n_embd_head_k(il) * hparams.n_head_kv(il);
+        GGML_ASSERT(kv_head + n_tokens <= kv.ktn_l[il]->ne[0]);
+        ggml_tensor * kk = ggml_reshape_2d(ctx, k_cur, n_kn, n_tokens);
+        ggml_tensor * en = ggml_sum_rows(ctx, ggml_sqr(ctx, kk));                       // [1,T]
+        ggml_tensor * s  = ggml_sqrt(ctx, ggml_clamp(ctx,
+                ggml_scale(ctx, en, 1.0f/(float) n_kn), 1e-12f, 1e30f));                // [1,T] row RMS
+        ggml_tensor * s3 = ggml_reshape_3d(ctx, s, 1, 1, n_tokens);
+        k_cur = ggml_div(ctx, k_cur, s3);
+        cb(k_cur, "Kcur_tknorm", il);
+        ggml_tensor * ktn_cpy = ggml_cpy(ctx, s,
+                ggml_view_1d(ctx, kv.ktn_l[il], n_tokens, (size_t) kv_head*sizeof(float)));
+        lctx.ktn_cache_copies[il].cpy  = ktn_cpy;
+        lctx.ktn_cache_copies[il].step = sizeof(float);
+        ggml_build_forward_expand(graph, ktn_cpy);
     }
 
     // these nodes are added to the graph together so that they are not reordered

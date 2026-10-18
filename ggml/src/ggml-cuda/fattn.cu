@@ -54,6 +54,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
     }
 
+    // K-cache token normalization (src[6]): only the mma-f16 kernel applies the
+    // per-key score scale, so refuse configurations that would take another FA kernel.
+    if (dst->src[6] != nullptr && !(fast_fp16_available(cc) && fp16_mma_available(cc) && new_mma_available(cc) &&
+            K->ne[0] == V->ne[0])) {
+        GGML_ABORT("K-cache token norm requires the mma-f16 flash attention kernel");
+    }
+
     ggml_tensor local_dst, Kl, Vl, Ml;
     if (n_swa > 0) {
         int ntokens = std::max(FATTN_KQ_STRIDE, int(Q->ne[1]));
@@ -133,13 +140,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     int gqa_ratio = Q->ne[2] / K->ne[2];
 
-    if (new_mma_available(cc) && K->ne[0] == 128 && V->ne[0] == 128 && Q->ne[0] == 128 && Q->ne[1] == 1 &&
+    if (dst->src[6] == nullptr && new_mma_available(cc) && K->ne[0] == 128 && V->ne[0] == 128 && Q->ne[0] == 128 && Q->ne[1] == 1 &&
             (gqa_ratio == 12 || gqa_ratio == 6 || gqa_ratio == 10)) {
         ggml_cuda_flash_attn_ext_mma_new(ctx, dst);
         return;
     }
 
-    if (new_mma_available(cc) && K->ne[0] == 256 && V->ne[0] == 256 && Q->ne[0] == 256 && Q->ne[1] == 1 && (gqa_ratio == 6 || gqa_ratio == 12)) {
+    if (dst->src[6] == nullptr && new_mma_available(cc) && K->ne[0] == 256 && V->ne[0] == 256 && Q->ne[0] == 256 && Q->ne[1] == 1 && (gqa_ratio == 6 || gqa_ratio == 12)) {
         ggml_cuda_flash_attn_ext_mma_new(ctx, dst);
         return;
     }
@@ -151,7 +158,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     //const bool mma_faster_for_bs1 = new_mma_available(cc) && gqa_opt_applies && cc < CC_ADA_LOVELACE && !mma_needs_data_conversion;
     const bool mma_faster_for_bs1 = new_mma_available(cc) && gqa_opt_applies && !(Q->ne[1] == 1 && n_swa > 0 && K->ne[0] == V->ne[0]);
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && K->ne[0] == V->ne[0] && Q->ne[0] % (2*WARP_SIZE) == 0;
-    if (Q->ne[1] == 1 && can_use_vector_kernel && !mma_faster_for_bs1 && !ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
+    if (dst->src[6] == nullptr && Q->ne[1] == 1 && can_use_vector_kernel && !mma_faster_for_bs1 && !ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
         ggml_cuda_flash_attn_ext_vec_f32(ctx, dst);
         return;
     }
@@ -163,7 +170,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // so no other implementation works.
     //
 
-    if (new_mma_available(cc) &&
+    if (dst->src[6] == nullptr && new_mma_available(cc) &&
             ((K->ne[0] == 576 && V->ne[0] == 512) ||
              (K->ne[0] == 320 && V->ne[0] == 256) ||
              (K->ne[0] == 512 && V->ne[0] == 512) ||

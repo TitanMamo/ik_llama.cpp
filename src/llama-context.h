@@ -87,6 +87,7 @@ struct llama_kv_cache {
     bool hybrid    = false;
     bool v_trans   = true;  // the value tensor is transposed
     bool kvarn     = false; // KVarN structured cache: the dense F16 mirrors (k_l/v_l) are not allocated
+    bool ktn       = false; // K-cache token normalization: per-token K rows are RMS-normalized, log-scale in the mask
 
     // openPangu s_l holds position-strict MoME conv state, not per-sequence recurrent slots: qnext
     // seq ops and generic serialization skip it, the openPangu state layouts carry it instead.
@@ -150,6 +151,7 @@ struct llama_kv_cache {
     // scoring representation so a decoded token scores against all past indexer keys.
     // Empty unless the model has the DSA indexer.
     std::vector<struct ggml_tensor *> kr_l;
+    std::vector<struct ggml_tensor *> ktn_l;   // K-cache token normalization: per-layer [kv_size] F16 log-RMS of the stored K rows
 
     // Pooled block keys for Qwen sparse attention: [indexer_head_size, kv_size/compress_ratio],
     // already normalized and rotated. Empty unless the model scores blocks.
@@ -791,6 +793,7 @@ struct llama_context {
     // uninitialized -> wrong block-max-pool/top-k -> degraded/NaN sparse-FA decode). Register the
     // kr_l cpy per layer here and patch its offset in update_cache_copies(), exactly like K/V.
     std::vector<CacheCopy> dsa_cache_copies;
+    std::vector<CacheCopy> ktn_cache_copies; // K-cache token normalization log-RMS writes (step = one F16 per token)
     std::vector<CacheCopy> openpangu_cache_copies;
     std::vector<CacheCopy> openpangu_cache_copies_mtp;
 

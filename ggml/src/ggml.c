@@ -11524,6 +11524,22 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+void ggml_flash_attn_ext_add_key_scale(
+        struct ggml_tensor * a,
+        struct ggml_tensor * key_scale) {
+    if (!key_scale) {
+        a->src[6] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[6] == NULL);
+    GGML_ASSERT(a->src[1]->ne[1] == key_scale->ne[0]);
+    GGML_ASSERT(key_scale->type == GGML_TYPE_F32);
+
+    a->src[6] = key_scale;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(
@@ -23720,6 +23736,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const struct ggml_tensor * v     = dst->src[2];
     const struct ggml_tensor * mask  = dst->src[3];
     const struct ggml_tensor * sinks = dst->src[4];
+
+    GGML_ASSERT(dst->src[6] == NULL && "K-cache token normalization requires the CUDA mma-f16 flash attention kernel");
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
