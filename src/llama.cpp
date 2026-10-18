@@ -9973,6 +9973,11 @@ struct llama_context * llama_init_from_model(
     if (cparams.kvarn.enabled) {
         const int64_t group = std::max<int64_t>(cparams.kvarn.group, 1);
         cparams.kvarn_stage_groups = (int32_t) ((cparams.n_ubatch + group - 1) / group + 3);
+        // experimental knob: pin the ring (F16 window) size for the
+        // F16-window vs normalization decomposition measurements
+        if (const char * sg = getenv("IK_KVARN_STAGE_GROUPS")) {
+            cparams.kvarn_stage_groups = std::max(2, atoi(sg));
+        }
     }
 
     cparams.n_ctx_orig_yarn  = params.yarn_orig_ctx    != 0 ? params.yarn_orig_ctx    :

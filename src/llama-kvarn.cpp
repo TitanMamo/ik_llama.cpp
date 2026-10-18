@@ -75,6 +75,12 @@ bool llama_kvarn_params_from_cache_types(
     params->sinkhorn_iters = 16;
     params->sink_tokens    = LLAMA_KVARN_SINK_TOKENS;
     params->alpha          = 1.0f;
+    // experimental knob: alpha=0 drops the variance normalization entirely
+    // (stores s**0 = 1, i.e. Hadamard-only RTN), used to decompose the KVarN
+    // benefit into the F16 window and the normalization parts
+    if (const char * a = getenv("IK_KVARN_ALPHA")) {
+        params->alpha = (float) atof(a);
+    }
 
     return true;
 }
