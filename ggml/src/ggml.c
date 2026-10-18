@@ -6955,6 +6955,7 @@ struct ggml_tensor * ggml_kvarn_attn(
         int                   n_slices,
         int                   sealed,
         float                 kq_scale,
+        float                 softcap,
         int                   state_layer,
         struct ggml_tensor  * state) {
     GGML_ASSERT(q && q->type == GGML_TYPE_F32);
@@ -6999,6 +7000,7 @@ struct ggml_tensor * ggml_kvarn_attn(
     memcpy(&result->op_params[5], &kq_scale, sizeof(float));
     result->op_params[6] = n_slices;
     result->op_params[7] = state_layer; /* attn: layer index */
+    memcpy(&result->op_params[GGML_KVARN_OP_SOFTCAP], &softcap, sizeof(float));
 
     return result;
 }

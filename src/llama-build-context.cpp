@@ -2344,10 +2344,19 @@ static ggml_tensor * llm_build_kqv(
     const bool kvarn_p5 = cparams.kvarn.enabled && cparams.flash_attn &&
             getenv("IK_KVARN_P5") != nullptr &&
             q_cur->ne[2] == 1 && sinks == nullptr && n_swa == 0 &&
-            hparams.f_attn_logit_softcapping == 0.0f &&
             hparams.f_max_alibi_bias == 0.0f &&
             kq_mask != nullptr && n_kv <= 24576 &&
             k_cache_view == nullptr && v_cache_view == nullptr;
+    if (getenv("IK_KVARN_P5") != nullptr && il == 0) {
+        static int p5dbg = 0;
+        if (p5dbg++ < 3) {
+            fprintf(stderr, "[p5-gate] kvarn=%d fa=%d ne2=%lld sinks=%d nswa=%d softcap=%.2f alibi=%.2f mask=%d n_kv=%lld kcv=%d vcv=%d -> %d\n",
+                    (int) cparams.kvarn.enabled, (int) cparams.flash_attn, (long long) q_cur->ne[2],
+                    sinks != nullptr, (int) n_swa, (double) hparams.f_attn_logit_softcapping,
+                    (double) hparams.f_max_alibi_bias, kq_mask != nullptr, (long long) n_kv,
+                    k_cache_view != nullptr, v_cache_view != nullptr, (int) kvarn_p5);
+        }
+    }
 
     // combined KVarN materialize: K and V spans in one node (v_flat is a
     // side-effect output written by the same node)
@@ -2444,8 +2453,9 @@ static ggml_tensor * llm_build_kqv(
                     kv.v_records[kv_layer], kv.v_stage[kv_layer],
                     lctx.inp_kvarn_pos, kq_mask,
                     (int) n_kv, cparams.kvarn.key_bits, cparams.kvarn.value_bits,
-                    kv.kvarn_stage_groups, n_slices, lctx.kvarn_sealed[kv_layer], kq_scale, kv_layer,
-                    lctx.inp_kvarn_state);
+                    kv.kvarn_stage_groups, n_slices, lctx.kvarn_sealed[kv_layer], kq_scale,
+                    hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f,
+                    kv_layer, lctx.inp_kvarn_state);
             kvarn_register_node(lctx, kv_layer, cur);
             cb(cur, "kvarn_attn", il);
         } else {

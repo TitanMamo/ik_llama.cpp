@@ -1153,9 +1153,10 @@ void ggml_cuda_kvarn_materialize(
 // ---------------------------------------------------------------------------
 // KVarN decode attention: one block per query head; scores straight from the
 // structured cache (records + F16 ring/sink), in-shared softmax with the
-// mask, then a per-channel PV phase. v1: one query token, no sinks/SWA/
-// softcap; the caller gates those conditions. n_kv is bounded by the dynamic
-// shared-memory budget for the score array (n_kv+256 floats; sm_86 ~24.5k).
+// mask, then a per-channel PV phase. v1: one query token, no sinks/SWA;
+// logit softcap supported (applied before the mask, like the FA kernels).
+// n_kv is bounded by the dynamic shared-memory budget for the score array
+// (n_kv+256 floats; sm_86 ~24.5k).
 // ---------------------------------------------------------------------------
 __global__ void kvarn_attn_kernel(
         const float * __restrict__ q, const int q_head_stride,
@@ -1167,7 +1168,7 @@ __global__ void kvarn_attn_kernel(
         const int Hq, const int Hkv,
         const int k_rows, const int v_rows, const int slots,
         const int32_t * __restrict__ state,
-        const int k_bits, const int v_bits, const float kq_scale,
+        const int k_bits, const int v_bits, const float kq_scale, const float softcap,
         const size_t k_record_bytes, const size_t v_record_bytes,
         const size_t k_payload_off, const size_t k_scale_off, const size_t k_zp_off, const size_t k_other_off,
         const size_t v_payload_off, const size_t v_scale_off, const size_t v_zp_off, const size_t v_other_off) {
@@ -1216,7 +1217,11 @@ __global__ void kvarn_attn_kernel(
                 }
             }
         }
-        S[i] = s * kq_scale + __half2float(mask[i]);
+        S[i] = s * kq_scale;
+        if (softcap > 0.0f) {
+            S[i] = softcap * tanhf(S[i] / softcap);
+        }
+        S[i] += __half2float(mask[i]);
     }
     __syncthreads();
 
@@ -1530,6 +1535,7 @@ void ggml_cuda_kvarn_attn_op(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const int   k_bits  = kvarn_op_int(dst, 3);
     const int   v_bits  = kvarn_op_int(dst, 4);
     const float kq_scale = kvarn_op_float(dst, 5);
+    const float softcap  = kvarn_op_float(dst, GGML_KVARN_OP_SOFTCAP);
     const int   n_slices = kvarn_op_int(dst, 6);
 
     const int Dk   = (int) q->ne[0];            // full K head dim
@@ -1579,7 +1585,7 @@ void ggml_cuda_kvarn_attn_op(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             (const int32_t *) indices->data, (const half *) mask->data,
             (float *) dst->data,
             n_kv, Dk, Dk_s, Dv, Dv_s, n_slices, Hq, Hkv, k_rows, v_rows, slots,
-            st, k_bits, v_bits, kq_scale,
+            st, k_bits, v_bits, kq_scale, softcap,
             k_layout.record_bytes, v_layout.record_bytes,
             k_layout.k_payload_off, k_layout.k_scale_off, k_layout.k_zp_off, k_layout.k_other_off,
             v_layout.v_payload_off, v_layout.v_scale_off, v_layout.v_zp_off, v_layout.v_other_off);

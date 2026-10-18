@@ -1357,6 +1357,7 @@ extern "C" {
             int                   n_slices,
             int                   sealed_group,
             float                 kq_scale,
+            float                 softcap,
                     int                   state_layer,
             struct ggml_tensor  * state);
 

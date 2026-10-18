@@ -828,6 +828,7 @@ void ggml_kvarn_compute_attn(struct ggml_tensor * dst, int ith, int nth) {
     const int     k_bits  = kvarn_op_int(dst, 3);
     const int     v_bits  = kvarn_op_int(dst, 4);
     const float   kq_scale = kvarn_op_float(dst, 5);
+    const float   softcap  = kvarn_op_float(dst, GGML_KVARN_OP_SOFTCAP);
     const int     n_slices = kvarn_op_int(dst, 6);
 
     const int64_t Dk = q->ne[0];            // full K head dim
@@ -923,7 +924,11 @@ void ggml_kvarn_compute_attn(struct ggml_tensor * dst, int ith, int nth) {
                 }
             }
             const float mv = ggml_fp16_to_fp32(mask_data[i]);
-            scores[i] = s * kq_scale + mv;
+            float sc = s * kq_scale;
+            if (softcap > 0.0f) {
+                sc = softcap * std::tanh(sc / softcap);
+            }
+            scores[i] = sc + mv;
             if (scores[i] > mask_max) {
                 mask_max = scores[i];
             }
