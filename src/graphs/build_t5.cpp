@@ -157,7 +157,7 @@ ggml_cgraph * llm_build_context::build_t5_decoder() {
                     model.layers[il].wk, nullptr,
                     model.layers[il].wv, nullptr, 0, il);
 
-            llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, Kcur, Vcur, n_tokens, kv_head, cb, il);
+            llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, Kcur, Vcur, n_tokens, kv_head, -1, cb, il);
 
             struct ggml_tensor * k =
                 ggml_view_3d(ctx0, kv_self.k_l[il],

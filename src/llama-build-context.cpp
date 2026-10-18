@@ -1003,10 +1003,14 @@ void llm_build_context::llm_build_kv_store(
          struct ggml_tensor * v_cur,
                     int32_t   n_tokens,
                     int32_t   kv_head,
+                    int32_t   kv_il,
          const llm_build_cb & cb,
                     int64_t   il) {
     const int64_t n_ctx = cparams.n_ctx;
     const int32_t n_cache_rows = kv.rows(il);
+    // the K-cache window ring is indexed like the attention's cache read
+    // (k_l[kv_il >= 0 ? kv_il : il]) so shared-KV archs stay consistent
+    const int kwl = kv_il >= 0 ? kv_il : (int) il;
 
     //const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
     const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
@@ -1127,8 +1131,8 @@ void llm_build_context::llm_build_kv_store(
         ggml_build_forward_expand(graph, lctx.cache_copies[2*il+0].cpy);
     }
 
-    if (k_cur && cparams.k_cache_window > 0 && kv.kwin &&
-        (size_t) il < kv.k_win_l.size() && kv.k_win_l[il] != nullptr) {
+    if (k_cur && cparams.k_cache_window > 0 && kv.kwin && kv.kwin_ok &&
+        (size_t) kwl < kv.k_win_l.size() && kv.k_win_l[kwl] != nullptr) {
         // K-cache window: ring-store the last min(n_tokens, N) K rows in F16.
         // The ring is keyed by cache cell modulo N; the attention reads the last
         // N cells ascending across the wrap (see llm_build_kqv).
@@ -1138,7 +1142,7 @@ void llm_build_context::llm_build_kv_store(
         const int64_t cell0  = first % n_win;
         const int64_t len1   = std::min<int64_t>(nw, n_win - cell0);
         const int64_t len2   = nw - len1;
-        const int64_t d_row  = ggml_row_size(kv.k_win_l[il]->type, n_embd_head_k);
+        const int64_t d_row  = ggml_row_size(kv.k_win_l[kwl]->type, n_embd_head_k);
         const int64_t cell_sz = d_row * n_head_kv;
         if (getenv("IK_KWIN_DEBUG") != nullptr && il == 0) {
             fprintf(stderr, "[kwin-store] kv_head=%d n_tokens=%d nw=%d first=%d cell0=%d len1=%d len2=%d | k_cur ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld]\n",
@@ -1154,7 +1158,7 @@ void llm_build_context::llm_build_kv_store(
                         k3->nb[1], k3->nb[2], (size_t) (n_tokens - nw)*k3->nb[2]);
 
         auto store_span = [&](int64_t cell, int64_t len, size_t src_off) {
-            ggml_tensor * dst = ggml_view_2d(ctx, kv.k_win_l[il], n_embd_head_k, len*n_head_kv, d_row, cell*cell_sz);
+            ggml_tensor * dst = ggml_view_2d(ctx, kv.k_win_l[kwl], n_embd_head_k, len*n_head_kv, d_row, cell*cell_sz);
             ggml_tensor * src = src_off == 0 && len == nw ? k_tail :
                     ggml_view_3d(ctx, k_tail, n_embd_head_k, n_head_kv, len,
                             k_tail->nb[1], k_tail->nb[2], src_off);
@@ -2518,7 +2522,7 @@ static ggml_tensor * llm_build_kqv(
         auto kq_size = k->ne[1]*q->ne[1]*q->ne[2]*sizeof(float)/(1024*1024);
         if (cparams.attn_max_batch == 0 || cparams.attn_max_batch >= kq_size || k->ne[2] != q->ne[2] || v->ne[2] != q->ne[2] || sinks) {
             struct ggml_tensor * kq = nullptr;
-            const bool kwin_on = cparams.k_cache_window > 0 && !cparams.kvarn.enabled &&
+            const bool kwin_on = cparams.k_cache_window > 0 && !cparams.kvarn.enabled && kv.kwin_ok &&
                     (size_t) kv_layer < kv.k_win_l.size() && kv.k_win_l[kv_layer] != nullptr;
             if (kwin_on) {
                 // the last N cells come from the K-cache F16 window; the rest from the
@@ -2712,15 +2716,18 @@ ggml_tensor * llm_build_context::llm_build_kv(
         }
     }
 
-    if (cparams.k_cache_token_norm && k_cur != nullptr && !cparams.kvarn.enabled &&
-        (size_t) il < kv.ktn_l.size() && kv.ktn_l[il] != nullptr) {
+    if (cparams.k_cache_token_norm && k_cur != nullptr && !cparams.kvarn.enabled) {
+        // the ktn scale cache is read at the attention's kv layer; resolve the same
+        // index here so shared-KV archs stay consistent
+        const int kwl = kv_il >= 0 ? kv_il : (int) il;
+        if ((size_t) kwl < kv.ktn_l.size() && kv.ktn_l[kwl] != nullptr) {
         // per-token K normalization (the KVarN token-scale fold, online): the
         // stored keys are divided by the token's row RMS and the RMS is written
         // to the per-layer scale cache; the FA multiplies each score by the
         // key's RMS, so s_t * (q . k') == (q . k) restores the exact attention
         // while the quantizer sees normalized rows.
         const int64_t n_kn = (int64_t) hparams.n_embd_head_k(il) * hparams.n_head_kv(il);
-        GGML_ASSERT(kv_head + n_tokens <= kv.ktn_l[il]->ne[0]);
+        GGML_ASSERT(kv_head + n_tokens <= kv.ktn_l[kwl]->ne[0]);
         ggml_tensor * kk = ggml_reshape_2d(ctx, k_cur, n_kn, n_tokens);
         ggml_tensor * en = ggml_sum_rows(ctx, ggml_sqr(ctx, kk));                       // [1,T]
         ggml_tensor * s  = ggml_sqrt(ctx, ggml_clamp(ctx,
@@ -2729,10 +2736,11 @@ ggml_tensor * llm_build_context::llm_build_kv(
         k_cur = ggml_div(ctx, k_cur, s3);
         cb(k_cur, "Kcur_tknorm", il);
         ggml_tensor * ktn_cpy = ggml_cpy(ctx, s,
-                ggml_view_1d(ctx, kv.ktn_l[il], n_tokens, (size_t) kv_head*sizeof(float)));
+                ggml_view_1d(ctx, kv.ktn_l[kwl], n_tokens, (size_t) kv_head*sizeof(float)));
         lctx.ktn_cache_copies[il].cpy  = ktn_cpy;
         lctx.ktn_cache_copies[il].step = sizeof(float);
         ggml_build_forward_expand(graph, ktn_cpy);
+        }
     }
 
     // these nodes are added to the graph together so that they are not reordered
@@ -2752,7 +2760,7 @@ ggml_tensor * llm_build_context::llm_build_kv(
     const int32_t kv_view_offset = use_swa_window ? (int32_t) lctx.swa_window_view.win_off : 0;
 
     if (k_cur || v_cur) {
-        llm_build_kv_store(lctx, ctx, hparams, cparams, kv, graph, k_cur, v_cur, n_tokens, store_head, cb, il);
+        llm_build_kv_store(lctx, ctx, hparams, cparams, kv, graph, k_cur, v_cur, n_tokens, store_head, kv_il, cb, il);
     }
 
     auto cur = llm_build_kqv(ctx, lctx, kv, graph, wo, wo_b, q_cur, kq_mask, n_tokens, n_kv_view, kq_scale, cb, il, sinks, n_swa, kv_il,

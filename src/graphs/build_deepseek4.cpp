@@ -1332,10 +1332,10 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
         }
     }
     if (raw_k_write == nullptr) {
-        llm.llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, kv, nullptr, n_tokens, llm.kv_head, cb, il);
+        llm.llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, kv, nullptr, n_tokens, llm.kv_head, -1, cb, il);
     }
     if (il < (int64_t) kv_self.v_l.size() && kv_self.v_l[il] != nullptr) {
-        llm.llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, nullptr, kv, n_tokens, llm.kv_head, cb, il);
+        llm.llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, nullptr, kv, n_tokens, llm.kv_head, -1, cb, il);
     }
 
     ggml_tensor * const read_idxs = plan_addressed ? lctx.dsv4.inputs.raw_k_read_idxs : nullptr;
@@ -2245,10 +2245,10 @@ static ggml_tensor * ds4_attention_v41(ggml_cgraph * gf, ggml_context * ctx0, ll
         }
     }
     if (raw_k_write == nullptr) {
-        llm.llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, kv, nullptr, n_tokens, llm.kv_head, cb, il);
+        llm.llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, kv, nullptr, n_tokens, llm.kv_head, -1, cb, il);
     }
     if (il < (int64_t) kv_self.v_l.size() && kv_self.v_l[il] != nullptr) {
-        llm.llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, nullptr, kv, n_tokens, llm.kv_head, cb, il);
+        llm.llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, nullptr, kv, n_tokens, llm.kv_head, -1, cb, il);
     }
 
     ggml_tensor * const read_idxs = plan_addressed ? lctx.dsv4.inputs.raw_k_read_idxs : nullptr;

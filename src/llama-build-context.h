@@ -496,6 +496,7 @@ struct llm_build_context {
          ggml_tensor * v_cur,
          int32_t   n_tokens,
          int32_t   kv_head,
+         int32_t   kv_il,
          const llm_build_cb & cb, int64_t il);
 
     static struct ggml_tensor * llm_build_kv(ggml_context * ctx, llama_context & lctx,

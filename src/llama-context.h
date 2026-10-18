@@ -89,6 +89,7 @@ struct llama_kv_cache {
     bool kvarn     = false; // KVarN structured cache: the dense F16 mirrors (k_l/v_l) are not allocated
     bool ktn       = false; // K-cache token normalization: per-token K rows are RMS-normalized, log-scale in the mask
     bool kwin      = false; // K-cache window: the last N tokens are kept in F16 (k_win_l) over the quantized K cache
+    bool kwin_ok   = true;  // the window assumes position == cell (linear, un-wrapped cache); cleared on head wrap
 
     // openPangu s_l holds position-strict MoME conv state, not per-sequence recurrent slots: qnext
     // seq ops and generic serialization skip it, the openPangu state layouts carry it instead.

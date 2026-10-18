@@ -7826,6 +7826,28 @@ static int llama_decode_internal(
         LLAMA_LOG_ERROR("%s: n_tokens == 0", __func__);
         return -1;
     }
+
+    // K-cache window: the "last N cells" ring is a single-stream assumption. Any
+    // multi-sequence batch (parallel slots, multi-sequence perplexity) mixes other
+    // sequences' cells into the window, so disable the window for this context.
+    if (lctx.cparams.k_cache_window > 0 && lctx.kv_self.kwin_ok) {
+        bool multi = false;
+        if (batch_all.n_seq_id) {
+            for (uint32_t i = 0; i < n_tokens_all && !multi; ++i) {
+                multi = batch_all.n_seq_id[i] != 1;
+            }
+        }
+        if (!multi && batch_all.seq_id) {
+            const llama_seq_id s0 = batch_all.seq_id[0][0];
+            for (uint32_t i = 1; i < n_tokens_all && !multi; ++i) {
+                multi = batch_all.seq_id[i][0] != s0;
+            }
+        }
+        if (multi) {
+            LLAMA_LOG_WARN("%s: K-cache window requires single-sequence decoding; disabling it for this context\n", __func__);
+            lctx.kv_self.kwin_ok = false;
+        }
+    }
 #if IK_PRINT_TIMING > 2
     printf("===== %s: %ld\n", __func__, ggml_time_us());
 #endif
@@ -8268,6 +8290,9 @@ static int llama_decode_internal(
             if (kv_self.head >= kv_self.size) {
                 // only the generic head wraps; the compacted rows still hold the live window
                 kv_self.head = 0;
+                // the K-cache window maps positions to cells modulo N; once the main
+                // cache wraps that mapping breaks, so fall back to the plain path
+                kv_self.kwin_ok = false;
             }
         }
 
@@ -8276,8 +8301,8 @@ static int llama_decode_internal(
             static int kwd_n = 0;
             if (kwd_n++ < 6) {
                 const int il = 0;
-                auto * kw = kv_self.k_win_l[il];
-                auto * kl = kv_self.k_l[il];
+                auto * kw = (size_t) il < kv_self.k_win_l.size() ? kv_self.k_win_l[il] : nullptr;
+                auto * kl = (size_t) il < kv_self.k_l.size() ? kv_self.k_l[il] : nullptr;
                 const auto & hp = lctx.model.hparams;
                 const int64_t D = hp.n_embd_head_k(il), H = hp.n_head_kv(il), N = cparams.k_cache_window;
                 if (kw && kl && kl->type == GGML_TYPE_F16) {
@@ -9984,6 +10009,12 @@ struct llama_context * llama_init_from_model(
             params.k_cache_window = 0;
         } else if (model->splits.size() > 1) {
             LLAMA_LOG_WARN("%s: K-cache window is not implemented with multi-device splits. Turning off\n", __func__);
+            params.k_cache_window = 0;
+        } else if (!model->hparams.causal_attn) {
+            LLAMA_LOG_WARN("%s: K-cache window requires causal attention. Turning off\n", __func__);
+            params.k_cache_window = 0;
+        } else if (model->hparams.n_lora_kv > 0 || model->hparams.indexer_head_size > 0) {
+            LLAMA_LOG_WARN("%s: K-cache window is not implemented for MLA or indexer-attention caches. Turning off\n", __func__);
             params.k_cache_window = 0;
         } else {
             bool has_swa = false;
