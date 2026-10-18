@@ -43,6 +43,7 @@ struct llama_cparams {
     bool k_cache_hadamard;
     bool v_cache_hadamard;
     bool k_cache_token_norm;
+    int32_t k_cache_window;
     llama_kvarn_params kvarn;
     // KVarN ring stage: 1 sink block + (kvarn_stage_groups-1) group slots,
     // sized from n_ubatch so lazy sealing is exact for any batch shape

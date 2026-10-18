@@ -486,6 +486,7 @@ struct gpt_params {
     bool k_cache_hadamard  = false; // if true, use Hadamard transform for the K-cache (only makes sense with quantized cache)
     bool v_cache_hadamard  = false; // if true, use Hadamard transform for the V-cache (only makes sense with quantized cache, which requires FA)
     bool k_cache_token_norm = false; // if true, normalize each K-cache token by its row RMS; the per-key scale is applied to the attention scores (quantized K + CUDA FA)
+    int32_t k_cache_window = 0; // >0: keep the last N K tokens in F16 (non-FA path, quantized K-cache); 0 = off
     bool split_mode_graph_scheduling = false; // if true, force split mode graph scheduling
     //bool split_mode_f16    = true;  // if true, intermediate results will be cast to f16 before copying to other GPUs to perform reduce ops
     bool scheduler_async   = false; // if true, in split mode graph the scheduler will use multiple threads to evaluate the graph

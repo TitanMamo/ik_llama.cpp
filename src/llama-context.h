@@ -88,6 +88,7 @@ struct llama_kv_cache {
     bool v_trans   = true;  // the value tensor is transposed
     bool kvarn     = false; // KVarN structured cache: the dense F16 mirrors (k_l/v_l) are not allocated
     bool ktn       = false; // K-cache token normalization: per-token K rows are RMS-normalized, log-scale in the mask
+    bool kwin      = false; // K-cache window: the last N tokens are kept in F16 (k_win_l) over the quantized K cache
 
     // openPangu s_l holds position-strict MoME conv state, not per-sequence recurrent slots: qnext
     // seq ops and generic serialization skip it, the openPangu state layouts carry it instead.
@@ -152,6 +153,7 @@ struct llama_kv_cache {
     // Empty unless the model has the DSA indexer.
     std::vector<struct ggml_tensor *> kr_l;
     std::vector<struct ggml_tensor *> ktn_l;   // K-cache token normalization: per-layer [kv_size] F16 log-RMS of the stored K rows
+    std::vector<struct ggml_tensor *> k_win_l; // K-cache window: per-layer F16 [n_embd_head_k, N*n_head_kv] ring of the last N K tokens
 
     // Pooled block keys for Qwen sparse attention: [indexer_head_size, kv_size/compress_ratio],
     // already normalized and rotated. Empty unless the model scores blocks.

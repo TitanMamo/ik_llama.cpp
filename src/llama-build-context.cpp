@@ -1127,6 +1127,42 @@ void llm_build_context::llm_build_kv_store(
         ggml_build_forward_expand(graph, lctx.cache_copies[2*il+0].cpy);
     }
 
+    if (k_cur && cparams.k_cache_window > 0 && kv.kwin &&
+        (size_t) il < kv.k_win_l.size() && kv.k_win_l[il] != nullptr) {
+        // K-cache window: ring-store the last min(n_tokens, N) K rows in F16.
+        // The ring is keyed by cache cell modulo N; the attention reads the last
+        // N cells ascending across the wrap (see llm_build_kqv).
+        const int64_t n_win  = cparams.k_cache_window;
+        const int64_t nw     = std::min<int64_t>(n_tokens, n_win);
+        const int64_t first  = (int64_t) kv_head + n_tokens - nw;
+        const int64_t cell0  = first % n_win;
+        const int64_t len1   = std::min<int64_t>(nw, n_win - cell0);
+        const int64_t len2   = nw - len1;
+        const int64_t d_row  = ggml_row_size(kv.k_win_l[il]->type, n_embd_head_k);
+        const int64_t cell_sz = d_row * n_head_kv;
+
+        ggml_tensor * k3 = k_cur->ne[0] == n_embd_head_k && k_cur->ne[1] == n_head_kv && k_cur->ne[2] == n_tokens
+                ? k_cur : ggml_reshape_3d(ctx, k_cur, n_embd_head_k, n_head_kv, n_tokens);
+        ggml_tensor * k_tail = nw == n_tokens ? k3 :
+                ggml_view_3d(ctx, k3, n_embd_head_k, n_head_kv, nw,
+                        k3->nb[1], k3->nb[2], (size_t) (n_tokens - nw)*k3->nb[2]);
+
+        auto store_span = [&](int64_t cell, int64_t len, size_t src_off) {
+            ggml_tensor * dst = ggml_view_2d(ctx, kv.k_win_l[il], n_embd_head_k, len*n_head_kv, d_row, cell*cell_sz);
+            ggml_tensor * src = src_off == 0 && len == nw ? k_tail :
+                    ggml_view_3d(ctx, k_tail, n_embd_head_k, n_head_kv, len,
+                            k_tail->nb[1], k_tail->nb[2], src_off);
+            ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
+            ggml_build_forward_expand(graph, cpy);
+        };
+        if (len1 > 0) {
+            store_span(cell0, len1, 0);
+        }
+        if (len2 > 0) {
+            store_span(0, len2, (size_t) len1*k_tail->nb[2]);
+        }
+    }
+
     if (v_cur) {
         ggml_tensor * v_cache_view = nullptr;
         if (!kv.v_trans) {
@@ -2465,16 +2501,59 @@ static ggml_tensor * llm_build_kqv(
 
         auto kq_size = k->ne[1]*q->ne[1]*q->ne[2]*sizeof(float)/(1024*1024);
         if (cparams.attn_max_batch == 0 || cparams.attn_max_batch >= kq_size || k->ne[2] != q->ne[2] || v->ne[2] != q->ne[2] || sinks) {
-            struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
-            cb(kq, "kq", il);
-
-            //ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-
-            if (should_use_f32_precision) {
-                // for this arch, we need to perform the KQ multiplication with F32 precision, otherwise we get NaNs
-                // ref: https://github.com/ggerganov/llama.cpp/pull/4490#issuecomment-1859055847
-                ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+            struct ggml_tensor * kq_mask_attn = kq_mask;
+            struct ggml_tensor * kq = nullptr;
+            const bool kwin_on = cparams.k_cache_window > 0 && !cparams.kvarn.enabled &&
+                    (size_t) kv_layer < kv.k_win_l.size() && kv.k_win_l[kv_layer] != nullptr;
+            if (kwin_on) {
+                // the last N cells come from the K-cache F16 window; the rest from the
+                // quantized cache. Ring cells [r, N) then [0, r) map to the last N
+                // cells in ascending order, so kq/mask/v stay in natural cell order.
+                const int64_t n_win = cparams.k_cache_window;
+                ggml_tensor * kwin = kv.k_win_l[kv_layer];
+                const int64_t d_row   = ggml_row_size(kwin->type, n_embd_head_k);
+                const int64_t cell_sz = d_row * n_head_kv;
+                auto kq_mm = [&](ggml_tensor * kk) {
+                    ggml_tensor * r = ggml_mul_mat(ctx, kk, q);
+                    if (should_use_f32_precision) {
+                        ggml_mul_mat_set_prec(r, GGML_PREC_F32);
+                    }
+                    return r;
+                };
+                if (n_kv <= n_win) {
+                    // no wrap yet: the whole visible context lives in the window
+                    kq = kq_mm(ggml_view_3d(ctx, kwin, n_embd_head_k, n_kv, n_head_kv, cell_sz, d_row, 0));
+                } else {
+                    const int64_t n_old = n_kv - n_win;
+                    const int64_t r     = n_kv % n_win;
+                    ggml_tensor * k_old = ggml_view_3d(ctx, k_cache, n_embd_head_k, n_old, n_head_kv,
+                            ggml_row_size(k_cache->type, n_embd_head_k)*n_head_kv,
+                            ggml_row_size(k_cache->type, n_embd_head_k),
+                            (size_t) kv_view_offset*ggml_row_size(k_cache->type, n_embd_head_k)*n_head_kv);
+                    kq = kq_mm(k_old);
+                    if (n_win - r > 0) {
+                        kq = ggml_concat(ctx, kq, kq_mm(ggml_view_3d(ctx, kwin,
+                                n_embd_head_k, n_win - r, n_head_kv, cell_sz, d_row, (size_t) r*cell_sz)), 0);
+                    }
+                    if (r > 0) {
+                        kq = ggml_concat(ctx, kq, kq_mm(ggml_view_3d(ctx, kwin,
+                                n_embd_head_k, r, n_head_kv, cell_sz, d_row, 0)), 0);
+                    }
+                    // mask in the same key order: cells [0, n_old) + [n_old, n_kv)
+                    kq_mask_attn = ggml_concat(ctx,
+                            ggml_view_2d(ctx, kq_mask, n_old, kq_mask->ne[1], kq_mask->nb[1], 0),
+                            ggml_view_2d(ctx, kq_mask, n_win, kq_mask->ne[1], kq_mask->nb[1], (size_t) n_old*sizeof(float)), 0);
+                }
+                cb(kq, "kq_win", il);
+            } else {
+                kq = ggml_mul_mat(ctx, k, q);
+                if (should_use_f32_precision) {
+                    // for this arch, we need to perform the KQ multiplication with F32 precision, otherwise we get NaNs
+                    // ref: https://github.com/ggerganov/llama.cpp/pull/4490#issuecomment-1859055847
+                    ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+                }
             }
+            cb(kq, "kq", il);
 
             if (model.arch == LLM_ARCH_GROK) {
                 // need to do the following:
@@ -2494,10 +2573,10 @@ static ggml_tensor * llm_build_kqv(
 
             if (hparams.attn_soft_cap) {
                 //kq = ggml_softcap(ctx, kq, 1.0f / hparams.f_attn_logit_softcapping, hparams.f_attn_logit_softcapping);
-                kq = ggml_softcap_max(ctx, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                kq = ggml_softcap_max(ctx, kq, kq_mask_attn, kq_scale, hparams.f_max_alibi_bias,
                         1.0f / hparams.f_attn_logit_softcapping, hparams.f_attn_logit_softcapping);
             } else {
-                kq = ggml_soft_max_ext(ctx, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
+                kq = ggml_soft_max_ext(ctx, kq, kq_mask_attn, kq_scale, hparams.f_max_alibi_bias);
                 ggml_soft_max_add_sinks(kq, sinks);
             }
             cb(kq, "kq_soft_max_ext", il);

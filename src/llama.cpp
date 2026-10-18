@@ -703,6 +703,7 @@ static void why_not_reuse_previous(const llama_batch & u_batch, const llama_cont
 
 bool llama_context::can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fingerprint, uint64_t model_state_hash) {
     if (!cparams.graph_reuse) return false;
+    if (cparams.k_cache_window > 0) return false; // the window ring's view shapes depend on the head modulo N
     if (qsa_pooled_stale) return false; // the rebuild needs a graph with the full pooling window
     if (cparams.kvarn.enabled && getenv("IK_KVARN_NO_REUSE") != nullptr) return false; // debug: force a rebuild
     auto the_prev = cparams.mtp_op_type == MTP_OP_NONE ? prev.get() : prev_mtp.get();
@@ -1553,6 +1554,10 @@ static bool llama_kv_cache_init(
         cache.ktn = true;
         cache.ktn_l.resize(n_layer, nullptr);
     }
+    if (cparams.k_cache_window > 0) {
+        cache.kwin = true;
+        cache.k_win_l.resize(n_layer, nullptr);
+    }
     if (has_qwen4exp_indexer) {
         cache.kp_l.resize(n_layer, nullptr);
     }
@@ -1793,6 +1798,16 @@ static bool llama_kv_cache_init(
                 ggml_tensor * ktn = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cache.rows(i));
                 ggml_format_name(ktn, "cache_ktn_l%d", i);
                 cache.ktn_l[i] = ktn;
+            }
+
+            if (cparams.k_cache_window > 0) {
+                // ring of the last N K tokens in F16; the attention reads the last N
+                // positions from here (ascending across the wrap) and the rest from
+                // the quantized cache
+                ggml_tensor * kwin = ggml_new_tensor_2d(ctx, GGML_TYPE_F16,
+                        hparams.n_embd_head_k(i), (int64_t) cparams.k_cache_window * hparams.n_head_kv(i));
+                ggml_format_name(kwin, "cache_kwin_l%d", i);
+                cache.k_win_l[i] = kwin;
             }
 
             auto k_name = std::string{"cache_k_l"} + std::to_string(i);
@@ -3128,6 +3143,12 @@ static void llama_kv_cache_defrag(struct llama_kv_cache & cache) {
         // the per-token log-scale rows are indexed by cache cell; moving cells
         // without moving them would desync - skipping is safe
         LLAMA_LOG_WARN("%s: defrag is not supported with K-cache token normalization - skipping\n", __func__);
+        return;
+    }
+    if (cache.kwin) {
+        // the F16 window ring is indexed by position modulo N; moving cells
+        // would desync the ring - skipping is safe
+        LLAMA_LOG_WARN("%s: defrag is not supported with a K-cache window - skipping\n", __func__);
         return;
     }
     cache.do_defrag = true;
@@ -9365,6 +9386,7 @@ struct llama_context_params llama_context_default_params() {
         /*.k_cache_hadamard            =*/ false,
         /*.v_cache_hadamard            =*/ false,
         /*.k_cache_token_norm          =*/ false,
+        /*.k_cache_window              =*/ 0,
         /*.split_mode_graph_scheduling =*/ false,
         // /*.split_mode_f16           =*/ true,
         /*.scheduler_async             =*/ false,
@@ -9912,6 +9934,40 @@ struct llama_context * llama_init_from_model(
         }
     }
 
+    if (params.k_cache_window > 0) {
+        if (params.kvarn.enabled) {
+            LLAMA_LOG_WARN("%s: K-cache window is not used with the KVarN structured cache. Turning off\n", __func__);
+            params.k_cache_window = 0;
+        } else if (params.k_cache_token_norm) {
+            LLAMA_LOG_WARN("%s: K-cache window is not combined with K-cache token normalization (yet). Turning off\n", __func__);
+            params.k_cache_window = 0;
+        } else if (params.flash_attn) {
+            LLAMA_LOG_WARN("%s: K-cache window v1 targets the non-FA attention path (the FA path would need a two-tier FA). Turning off\n", __func__);
+            params.k_cache_window = 0;
+        } else if (!ggml_is_quantized(params.type_k)) {
+            LLAMA_LOG_WARN("%s: there is no point in a K-cache F16 window with a not quantized K-cache. Turning off\n", __func__);
+            params.k_cache_window = 0;
+        } else if (params.type_v != GGML_TYPE_F16) {
+            LLAMA_LOG_WARN("%s: K-cache window v1 requires an F16 V-cache (quantized V needs FA). Turning off\n", __func__);
+            params.k_cache_window = 0;
+        } else if (params.n_ctx <= params.k_cache_window + 64) {
+            LLAMA_LOG_WARN("%s: K-cache window %d is too large for the context (%d). Turning off\n", __func__, params.k_cache_window, (int) params.n_ctx);
+            params.k_cache_window = 0;
+        } else if (model->splits.size() > 1) {
+            LLAMA_LOG_WARN("%s: K-cache window is not implemented with multi-device splits. Turning off\n", __func__);
+            params.k_cache_window = 0;
+        } else {
+            bool has_swa = false;
+            for (int il = 0; il < model->hparams.n_layer && !has_swa; ++il) {
+                has_swa = model->hparams.swa_layers[il] != 0;
+            }
+            if (has_swa) {
+                LLAMA_LOG_WARN("%s: K-cache window is not implemented with sliding-window attention. Turning off\n", __func__);
+                params.k_cache_window = 0;
+            }
+        }
+    }
+
     llama_context * ctx = new llama_context(*model);
 
     // add devices to ctx->cparams from model
@@ -9967,6 +10023,11 @@ struct llama_context * llama_init_from_model(
     cparams.prefetch_experts = params.prefetch_experts;
     cparams.k_cache_hadamard = params.k_cache_hadamard;
     cparams.k_cache_token_norm = params.k_cache_token_norm;
+    cparams.k_cache_window   = params.k_cache_window;
+    if (cparams.k_cache_window > 0) {
+        // the window attention reorders keys; keep the un-chunked kq path
+        cparams.attn_max_batch = 0;
+    }
     cparams.v_cache_hadamard = params.v_cache_hadamard;
     cparams.kvarn            = params.kvarn;
     // Folding H into wv_b/wk_b_pp permanently mutates the model; a later context
@@ -10045,6 +10106,12 @@ struct llama_context * llama_init_from_model(
         if (const char * sg = getenv("IK_KVARN_STAGE_GROUPS")) {
             cparams.kvarn_stage_groups = std::max(2, atoi(sg));
         }
+    }
+
+    if (cparams.k_cache_window > 0 && cparams.k_cache_window >= cparams.n_ctx) {
+        LLAMA_LOG_WARN("%s: K-cache window %d is too large for the context (%d). Turning off\n",
+                __func__, cparams.k_cache_window, (int) cparams.n_ctx);
+        cparams.k_cache_window = 0;
     }
 
     cparams.n_ctx_orig_yarn  = params.yarn_orig_ctx    != 0 ? params.yarn_orig_ctx    :
@@ -11545,7 +11612,7 @@ void llama_spec_ckpt_discard(struct llama_context * ctx) {
 }
 
 bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    if ((ctx->cparams.kvarn.enabled || ctx->cparams.k_cache_token_norm) && !(p0 < 0 && p1 < 0)) {
+    if ((ctx->cparams.kvarn.enabled || ctx->cparams.k_cache_token_norm || ctx->cparams.k_cache_window > 0) && !(p0 < 0 && p1 < 0)) {
         // v1 contract: one contiguous token stream; only the full clear is
         // supported (a partial removal would rewind into sealed records / stale scales)
         LLAMA_LOG_ERROR("%s: partial seq_rm is not supported with a KVarN structured cache or K-cache token normalization; use a full clear\n", __func__);
@@ -11564,7 +11631,7 @@ bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llam
 }
 
 void llama_kv_cache_seq_cp(struct llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
-    if (ctx->cparams.kvarn.enabled || ctx->cparams.k_cache_token_norm) {
+    if (ctx->cparams.kvarn.enabled || ctx->cparams.k_cache_token_norm || ctx->cparams.k_cache_window > 0) {
         LLAMA_LOG_ERROR("%s: seq_cp is not supported with a KVarN structured cache or K-cache token normalization (one contiguous stream, v1)\n", __func__);
         return;
     }
@@ -11578,7 +11645,7 @@ void llama_kv_cache_seq_cp(struct llama_context * ctx, llama_seq_id seq_id_src, 
 }
 
 void llama_kv_cache_seq_keep(struct llama_context * ctx, llama_seq_id seq_id) {
-    if (ctx->cparams.kvarn.enabled || ctx->cparams.k_cache_token_norm) {
+    if (ctx->cparams.kvarn.enabled || ctx->cparams.k_cache_token_norm || ctx->cparams.k_cache_window > 0) {
         LLAMA_LOG_ERROR("%s: seq_keep is not supported with a KVarN structured cache or K-cache token normalization (one contiguous stream, v1)\n", __func__);
         return;
     }
@@ -11586,7 +11653,7 @@ void llama_kv_cache_seq_keep(struct llama_context * ctx, llama_seq_id seq_id) {
 }
 
 void llama_kv_cache_seq_add(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
-    if (ctx->cparams.kvarn.enabled || ctx->cparams.k_cache_token_norm) {
+    if (ctx->cparams.kvarn.enabled || ctx->cparams.k_cache_token_norm || ctx->cparams.k_cache_window > 0) {
         LLAMA_LOG_ERROR("%s: seq_add (position shift) is not supported with a KVarN structured cache or K-cache token normalization (v1)\n", __func__);
         return;
     }
@@ -11598,7 +11665,7 @@ void llama_kv_cache_seq_add(struct llama_context * ctx, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache_seq_div(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
-    if (ctx->cparams.kvarn.enabled || ctx->cparams.k_cache_token_norm) {
+    if (ctx->cparams.kvarn.enabled || ctx->cparams.k_cache_token_norm || ctx->cparams.k_cache_window > 0) {
         LLAMA_LOG_ERROR("%s: seq_div (position division) is not supported with a KVarN structured cache or K-cache token normalization (v1)\n", __func__);
         return;
     }
@@ -13475,7 +13542,7 @@ static bool llama_state_io_supported(
         LLAMA_LOG_ERROR("%s: only per-sequence state save/restore is supported for openPangu (whole-context and file-session state are not)\n", func);
         return false;
     }
-    if (ctx->cparams.kvarn.enabled || ctx->cparams.k_cache_token_norm) {
+    if (ctx->cparams.kvarn.enabled || ctx->cparams.k_cache_token_norm || ctx->cparams.k_cache_window > 0) {
         LLAMA_LOG_ERROR("%s: KV state save/restore is not supported with a KVarN structured cache or K-cache token normalization yet\n", func);
         return false;
     }

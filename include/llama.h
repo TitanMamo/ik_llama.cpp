@@ -549,6 +549,7 @@ extern "C" {
         bool k_cache_hadamard;  // if true, apply Hadamard transform to K-cache
         bool v_cache_hadamard;  // if true, apply Hadamard transform to V-cache (needs FA)
         bool k_cache_token_norm; // if true, normalize each K-cache token by its row RMS; the per-key scale is applied to the attention scores (quantized K + CUDA FA)
+        int32_t k_cache_window; // >0: keep the last N K tokens in F16 (non-FA path, quantized K-cache); 0 = off
         bool split_mode_graph_scheduling; // if true, force split mode graph scheduling
         //bool split_mode_f16;    // if true, cast intermediate results to f16 before copying to other GPUs
         bool scheduler_async;   // if true, with split mode "graph" graph evaluation will be done using multiple threads

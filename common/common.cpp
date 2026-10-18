@@ -1012,6 +1012,7 @@ void gpt_params_parse_from_env(gpt_params & params) {
     get_env("LLAMA_ARG_K_CACHE_HADAMARD", params.k_cache_hadamard);
     get_env("LLAMA_ARG_V_CACHE_HADAMARD", params.v_cache_hadamard);
     get_env("LLAMA_ARG_K_CACHE_TOKEN_NORM", params.k_cache_token_norm);
+    get_env("LLAMA_ARG_K_CACHE_WINDOW", params.k_cache_window);
 
 }
 
@@ -2504,6 +2505,14 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.k_cache_token_norm = true;
         return true;
     }
+    if (arg == "-kwin" || arg == "--k-cache-window") {
+        if (++i >= argc) { invalid_param = true; return true; }
+        params.k_cache_window = std::stoi(argv[i]);
+        if (params.k_cache_window != 0 && (params.k_cache_window < 32 || params.k_cache_window % 32 != 0)) {
+            invalid_param = true; return true;
+        }
+        return true;
+    }
     if (arg == "-vhad" || arg == "--v-cache-hadamard") {
         params.v_cache_hadamard = true;
         return true;
@@ -3376,6 +3385,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",         "-muge,  --merge-up-gate-experts","merge ffn_up/gate_exps (default: %d)", params.merge_up_gate_exps});
     options.push_back({ "*",         "-khad,  --k-cache-hadamard",     "Use Hadamard transform for K-cache (default: %d)", params.k_cache_hadamard});
     options.push_back({ "*",         "-ktn,   --k-cache-token-norm",   "Normalize each K-cache token by its row RMS; the per-key scale is applied to the attention scores (needs FA + a quantized K cache, CUDA mma-f16, default: %d)", params.k_cache_token_norm});
+    options.push_back({ "*",         "-kwin N,--k-cache-window N",     "Keep the last N K tokens in F16 over a quantized K cache (non-FA path only, N multiple of 32, default: %d)", params.k_cache_window});
     options.push_back({ "*",         "-vhad,  --v-cache-hadamard",     "Use Hadamard transform for V-cache (default: %d)", params.v_cache_hadamard});
     options.push_back({ "*",         "-smf16, --split-mode-f16",       "Use f16 for data exchange between GPUs (default: %d)", true});
     options.push_back({ "*",         "-smf32, --split-mode-f32",       "Use f32 for data exchange between GPUs (default: %d)", false});
@@ -4758,6 +4768,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.k_cache_hadamard  = params.k_cache_hadamard;
     cparams.v_cache_hadamard  = params.v_cache_hadamard;
     cparams.k_cache_token_norm = params.k_cache_token_norm;
+    cparams.k_cache_window    = params.k_cache_window;
     cparams.split_mode_graph_scheduling = params.split_mode_graph_scheduling;
     //cparams.split_mode_f16    = params.split_mode_f16;
     cparams.scheduler_async   = params.scheduler_async;
