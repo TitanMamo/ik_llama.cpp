@@ -1157,6 +1157,12 @@ void ggml_cuda_kvarn_materialize(
 // logit softcap supported (applied before the mask, like the FA kernels).
 // n_kv is bounded by the dynamic shared-memory budget for the score array
 // (n_kv+256 floats; sm_86 ~24.5k).
+//
+// SPEED (measured, VT-3B kvarn4, 12.7k context): this v1 kernel runs at
+// ~3 t/s vs the materialize path's ~36 t/s - it is ALU-bound on the scalar
+// record bit-unpack (~140M unpacks/token at this depth) and only Hq (~16)
+// blocks wide. Keep it as the correctness reference / small-context path;
+// a performant version needs vectorized unpack + a split-key reduction.
 // ---------------------------------------------------------------------------
 __global__ void kvarn_attn_kernel(
         const float * __restrict__ q, const int q_head_stride,
