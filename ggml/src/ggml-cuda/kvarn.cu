@@ -1154,7 +1154,8 @@ void ggml_cuda_kvarn_materialize(
 // KVarN decode attention: one block per query head; scores straight from the
 // structured cache (records + F16 ring/sink), in-shared softmax with the
 // mask, then a per-channel PV phase. v1: one query token, no sinks/SWA/
-// softcap; the caller gates those conditions and n_kv <= 8192.
+// softcap; the caller gates those conditions. n_kv is bounded by the dynamic
+// shared-memory budget for the score array (n_kv+256 floats; sm_86 ~24.5k).
 // ---------------------------------------------------------------------------
 __global__ void kvarn_attn_kernel(
         const float * __restrict__ q, const int q_head_stride,
@@ -1545,7 +1546,7 @@ void ggml_cuda_kvarn_attn_op(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const int slots  = S - 1;
     GGML_ASSERT(Hkv > 0 && Hq % Hkv == 0);
     GGML_ASSERT(q->ne[1] == 1);
-    GGML_ASSERT(n_kv > 0 && n_kv <= 8192);
+    GGML_ASSERT(n_kv > 0);
     GGML_ASSERT((Dk_s == 64 || Dk_s == 128) && (Dv_s == 64 || Dv_s == 128));
 
     const struct ggml_kvarn_layout k_layout = ggml_kvarn_layout_make(Dk_s, 128, k_bits, v_bits);
@@ -1554,6 +1555,23 @@ void ggml_cuda_kvarn_attn_op(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     GGML_ASSERT((size_t) v_rec->ne[0] == v_layout.record_bytes);
 
     const size_t smem_bytes = (size_t(n_kv) + 256) * sizeof(float);
+    // the per-key score array lives in dynamic shared memory: opt in once to the
+    // device's extended budget (sm_86: 99 KB -> n_kv up to ~24.5k) and fail with a
+    // clear message when a longer context does not fit.
+    static int max_smem_optin = -1;
+    if (max_smem_optin < 0) {
+        int dev = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        int v = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+        max_smem_optin = v;
+        if (max_smem_optin > 48*1024) {
+            CUDA_CHECK(cudaFuncSetAttribute(kvarn_attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_smem_optin));
+        }
+    }
+    if ((int) smem_bytes > max_smem_optin) {
+        GGML_ABORT("kvarn attn: n_kv exceeds the device's dynamic shared-memory budget");
+    }
     kvarn_attn_kernel<<<Hq, 256, smem_bytes, ctx.stream()>>>(
             (const float *) q->data, (int) (q->nb[2] / sizeof(float)),
             (const uint8_t *) k_rec->data, (const half *) k_stage->data,

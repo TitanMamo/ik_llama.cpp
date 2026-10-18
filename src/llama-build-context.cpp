@@ -2346,7 +2346,7 @@ static ggml_tensor * llm_build_kqv(
             q_cur->ne[2] == 1 && sinks == nullptr && n_swa == 0 &&
             hparams.f_attn_logit_softcapping == 0.0f &&
             hparams.f_max_alibi_bias == 0.0f &&
-            kq_mask != nullptr && n_kv <= 8192 &&
+            kq_mask != nullptr && n_kv <= 24576 &&
             k_cache_view == nullptr && v_cache_view == nullptr;
 
     // combined KVarN materialize: K and V spans in one node (v_flat is a
