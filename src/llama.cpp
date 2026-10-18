@@ -8271,6 +8271,35 @@ static int llama_decode_internal(
             }
         }
 
+        if (cparams.k_cache_window > 0 && getenv("IK_KWIN_DEBUG") != nullptr) {
+            // debug: byte-compare the F16 ring against an F16 K cache (same k_cur values)
+            static int kwd_n = 0;
+            if (kwd_n++ < 6) {
+                const int il = 0;
+                auto * kw = kv_self.k_win_l[il];
+                auto * kl = kv_self.k_l[il];
+                const auto & hp = lctx.model.hparams;
+                const int64_t D = hp.n_embd_head_k(il), H = hp.n_head_kv(il), N = cparams.k_cache_window;
+                if (kw && kl && kl->type == GGML_TYPE_F16) {
+                    const int64_t esz = D*H*ggml_element_size(kl);
+                    const int64_t head = kv_self.head;
+                    const int64_t p0 = std::max<int64_t>(0, head - N);
+                    if (head > p0) {
+                        std::vector<uint8_t> ring((size_t) N*esz), row((size_t) esz);
+                        ggml_backend_tensor_get(kw, ring.data(), 0, ring.size());
+                        int64_t n_mis = 0, n_cmp = 0;
+                        for (int64_t p = p0; p < head; ++p) {
+                            ggml_backend_tensor_get(kl, row.data(), (size_t) p*esz, esz);
+                            const uint8_t * rr = ring.data() + (size_t) (p % N)*esz;
+                            for (int64_t e = 0; e < esz; ++e) { n_cmp++; n_mis += (rr[e] != row[e]); }
+                        }
+                        fprintf(stderr, "[kwin-dbg] head=%lld p0=%lld mismatched bytes: %lld/%lld\n",
+                                (long long) head, (long long) p0, (long long) n_mis, (long long) n_cmp);
+                    }
+                }
+            }
+        }
+
         // plot the computation graph in dot format (for debugging purposes)
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
@@ -9944,7 +9973,7 @@ struct llama_context * llama_init_from_model(
         } else if (params.flash_attn) {
             LLAMA_LOG_WARN("%s: K-cache window v1 targets the non-FA attention path (the FA path would need a two-tier FA). Turning off\n", __func__);
             params.k_cache_window = 0;
-        } else if (!ggml_is_quantized(params.type_k)) {
+        } else if (!ggml_is_quantized(params.type_k) && getenv("IK_KWIN_DEBUG") == nullptr) {
             LLAMA_LOG_WARN("%s: there is no point in a K-cache F16 window with a not quantized K-cache. Turning off\n", __func__);
             params.k_cache_window = 0;
         } else if (params.type_v != GGML_TYPE_F16) {

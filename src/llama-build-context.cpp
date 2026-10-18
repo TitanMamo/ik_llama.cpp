@@ -1140,6 +1140,12 @@ void llm_build_context::llm_build_kv_store(
         const int64_t len2   = nw - len1;
         const int64_t d_row  = ggml_row_size(kv.k_win_l[il]->type, n_embd_head_k);
         const int64_t cell_sz = d_row * n_head_kv;
+        if (getenv("IK_KWIN_DEBUG") != nullptr && il == 0) {
+            fprintf(stderr, "[kwin-store] kv_head=%d n_tokens=%d nw=%d first=%d cell0=%d len1=%d len2=%d | k_cur ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld]\n",
+                    (int) kv_head, (int) n_tokens, (int) nw, (int) first, (int) cell0, (int) len1, (int) len2,
+                    (long long) k_cur->ne[0], (long long) k_cur->ne[1], (long long) k_cur->ne[2], (long long) k_cur->ne[3],
+                    (long long) k_cur->nb[1], (long long) k_cur->nb[2], (long long) k_cur->nb[3]);
+        }
 
         ggml_tensor * k3 = k_cur->ne[0] == n_embd_head_k && k_cur->ne[1] == n_head_kv && k_cur->ne[2] == n_tokens
                 ? k_cur : ggml_reshape_3d(ctx, k_cur, n_embd_head_k, n_head_kv, n_tokens);
@@ -2501,14 +2507,14 @@ static ggml_tensor * llm_build_kqv(
 
         auto kq_size = k->ne[1]*q->ne[1]*q->ne[2]*sizeof(float)/(1024*1024);
         if (cparams.attn_max_batch == 0 || cparams.attn_max_batch >= kq_size || k->ne[2] != q->ne[2] || v->ne[2] != q->ne[2] || sinks) {
-            struct ggml_tensor * kq_mask_attn = kq_mask;
             struct ggml_tensor * kq = nullptr;
             const bool kwin_on = cparams.k_cache_window > 0 && !cparams.kvarn.enabled &&
                     (size_t) kv_layer < kv.k_win_l.size() && kv.k_win_l[kv_layer] != nullptr;
             if (kwin_on) {
                 // the last N cells come from the K-cache F16 window; the rest from the
                 // quantized cache. Ring cells [r, N) then [0, r) map to the last N
-                // cells in ascending order, so kq/mask/v stay in natural cell order.
+                // cells in ascending order, so the concatenated kq is in natural cell
+                // order 0..n_kv-1: the mask and V need no reordering.
                 const int64_t n_win = cparams.k_cache_window;
                 ggml_tensor * kwin = kv.k_win_l[kv_layer];
                 const int64_t d_row   = ggml_row_size(kwin->type, n_embd_head_k);
@@ -2539,12 +2545,12 @@ static ggml_tensor * llm_build_kqv(
                         kq = ggml_concat(ctx, kq, kq_mm(ggml_view_3d(ctx, kwin,
                                 n_embd_head_k, r, n_head_kv, cell_sz, d_row, 0)), 0);
                     }
-                    // mask in the same key order: cells [0, n_old) + [n_old, n_kv)
-                    kq_mask_attn = ggml_concat(ctx,
-                            ggml_view_2d(ctx, kq_mask, n_old, kq_mask->ne[1], kq_mask->nb[1], 0),
-                            ggml_view_2d(ctx, kq_mask, n_win, kq_mask->ne[1], kq_mask->nb[1], (size_t) n_old*sizeof(float)), 0);
                 }
                 cb(kq, "kq_win", il);
+                if (getenv("IK_KWIN_DEBUG") != nullptr && il == 0) {
+                    fprintf(stderr, "[kwin-attn] n_kv=%d n_win=%d n_old=%d r=%d n_kv_view_off=%d\n",
+                            (int) n_kv, (int) n_win, (int) (n_kv - n_win), (int) (n_kv % n_win), (int) kv_view_offset);
+                }
             } else {
                 kq = ggml_mul_mat(ctx, k, q);
                 if (should_use_f32_precision) {
@@ -2573,10 +2579,10 @@ static ggml_tensor * llm_build_kqv(
 
             if (hparams.attn_soft_cap) {
                 //kq = ggml_softcap(ctx, kq, 1.0f / hparams.f_attn_logit_softcapping, hparams.f_attn_logit_softcapping);
-                kq = ggml_softcap_max(ctx, kq, kq_mask_attn, kq_scale, hparams.f_max_alibi_bias,
+                kq = ggml_softcap_max(ctx, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                         1.0f / hparams.f_attn_logit_softcapping, hparams.f_attn_logit_softcapping);
             } else {
-                kq = ggml_soft_max_ext(ctx, kq, kq_mask_attn, kq_scale, hparams.f_max_alibi_bias);
+                kq = ggml_soft_max_ext(ctx, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
                 ggml_soft_max_add_sinks(kq, sinks);
             }
             cb(kq, "kq_soft_max_ext", il);
