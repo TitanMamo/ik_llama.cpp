@@ -247,6 +247,7 @@ struct llm_build_context {
 
     ggml_cgraph * build_mellum();
     ggml_cgraph * build_maple();
+    ggml_cgraph * build_spark2_5();
 
     ggml_cgraph * build_qwen3vlmoe();
 

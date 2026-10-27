@@ -140,6 +140,7 @@ struct create_tensors_helper : public create_tensors_helper_interface {
     bool create_deepseek2_tensors(const LLM_TN & tn);
     bool create_deepseek4_tensors(const LLM_TN & tn);
     bool create_maple_tensors(const LLM_TN & tn);
+    bool create_spark2_5_tensors(const LLM_TN & tn);
     bool create_openpangu_tensors(const LLM_TN & tn);
 
     bool create_glm_dsa_tensors(const LLM_TN & tn);
@@ -1765,6 +1766,54 @@ bool create_tensors_helper::create_maple_tensors(const LLM_TN & tn) {
         }
 
         use_mmap_buffer &= !create_std_ffn_exps(n_embd, tn, i);
+    }
+    return use_mmap_buffer;
+}
+
+bool create_tensors_helper::create_spark2_5_tensors(const LLM_TN & tn) {
+    LOADING_PRELUDE
+
+    model.tok_embd = create_embd(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), n_embd, n_vocab);
+
+    model.output_norm = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
+    model.output      = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab},
+            llama_model_loader::TENSOR_NOT_REQUIRED);
+    if (model.output == NULL) {
+        // the head is tied to the token embedding
+        model.output = create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab},
+                llama_model_loader::TENSOR_DUPLICATED);
+    }
+
+    for (int i = 0; i < n_layer; ++i) {
+        ggml_context * ctx_layer = ctx_for_layer(i);
+        ggml_context * ctx_split = ctx_for_layer_split(i);
+
+        auto & layer = model.layers[i];
+
+        // head_dim is stored explicitly (attention.key_length), so it is not n_embd / n_head
+        const int64_t n_head_i        = hparams.n_head(i);
+        const int64_t n_head_kv_i     = hparams.n_head_kv(i);
+        const int64_t n_embd_head_k_i = hparams.n_embd_head_k(i);
+        const int64_t n_embd_head_v_i = hparams.n_embd_head_v(i);
+        const int64_t n_embd_q        = n_embd_head_k_i * n_head_i;
+        const int64_t n_embd_k_i      = n_embd_head_k_i * n_head_kv_i;
+        const int64_t n_embd_v_i      = n_embd_head_v_i * n_head_kv_i;
+
+        layer.attn_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
+
+        // fused q|k|v projection
+        layer.wqkv = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_QKV, "weight", i),
+                {n_embd, n_embd_q + n_embd_k_i + n_embd_v_i});
+
+        // head-wise attention output gate: one scalar per head
+        layer.wqkv_gate = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_head_i});
+
+        layer.wo = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_q, n_embd});
+
+        auto ffn_ctx = model.split_mode == LLAMA_SPLIT_MODE_GRAPH ? ctx_split : ctx_layer;
+        layer.ffn_norm = create_tensor(ffn_ctx, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd});
+
+        create_std_ffn(i, tn, layer, n_ff, n_embd, ffn_ctx);
     }
     return use_mmap_buffer;
 }
@@ -6190,6 +6239,8 @@ bool create_tensors_helper::create_tensors() {
             use_mmap_buffer = create_deepseek4_tensors(tn); break;
         case LLM_ARCH_MAPLE:
             use_mmap_buffer = create_maple_tensors(tn); break;
+        case LLM_ARCH_SPARK2_5:
+            use_mmap_buffer = create_spark2_5_tensors(tn); break;
         case LLM_ARCH_GLM_DSA:
             use_mmap_buffer = create_glm_dsa_tensors(tn); break;
         case LLM_ARCH_OPENPANGU:

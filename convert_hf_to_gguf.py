@@ -606,6 +606,9 @@ class Model:
         if chkhsh == "972da7b59cec44d1f0a490a86c96df53859e486e481563e5dddac155013d87ac":
             # ref: https://huggingface.co/poolside/Laguna-XS.2
             res = "laguna"
+        if chkhsh == "0a766d034107bc736a3f2dc4968fd62e54a3570f1454443e0c5a4cc6bd7941ed":
+            # ref: https://huggingface.co/XHToken/Spark-X2.6-4B
+            res = "spark2_5"
         if chkhsh == "169bf0296a13c4d9b7672313f749eb36501d931022de052aad6e36f2bf34dd51":
             # ref: https://huggingface.co/LiquidAI/LFM2-Tokenizer
             res = "lfm2"
@@ -7339,6 +7342,82 @@ class LazyTorchTensor(gguf.LazyBase):
             return args[0].numpy()
 
         return cls._wrap_fn(func)(*args, **kwargs)
+
+
+@Model.register("Spark2_5ForCausalLM")
+class Spark2_5Model(Model):
+    model_arch = gguf.MODEL_ARCH.SPARK2_5
+
+    def set_gguf_parameters(self):
+        # the base class writes the shared keys (context length, embedding length, ff length,
+        # head counts, head_dim -> key/value length, rms eps, file type), plus rope_theta when
+        # it is a top-level hparam. Spark keeps the rotary config per layer type, so the rope
+        # keys are written below instead.
+        super().set_gguf_parameters()
+
+        hparams = self.hparams
+        arch = gguf.MODEL_ARCH_NAMES[self.model_arch]
+
+        layer_types = hparams["layer_types"]
+        if len(layer_types) != self.block_count:
+            raise ValueError(
+                f"Spark2_5 layer_types length {len(layer_types)} != num_hidden_layers {self.block_count}"
+            )
+        if any(layer_type not in ("sliding_attention", "full_attention") for layer_type in layer_types):
+            raise ValueError(f"Spark2_5 has unsupported layer_types: {layer_types}")
+        if hparams.get("gate_attn_act_mode") != "sigmoid" or hparams.get("headwise_attn_output_gate") is not True:
+            raise ValueError("Spark2_5 conversion requires head-wise sigmoid attention gates")
+        if hparams.get("hidden_act") != "gelu":
+            raise ValueError(f"Spark2_5 conversion requires GELU, got {hparams.get('hidden_act')!r}")
+
+        head_dim = int(hparams["head_dim"])
+        rope_params = hparams.get("rope_parameters", {})
+        full_rope = rope_params.get("full_attention", {})
+        swa_rope = rope_params.get("sliding_attention", {})
+
+        self.gguf_writer.add_vocab_size(int(hparams["vocab_size"]))
+        self.gguf_writer.add_sliding_window(int(hparams["sliding_window"]))
+        self.gguf_writer.add_sliding_window_pattern(
+            [layer_type == "sliding_attention" for layer_type in layer_types]
+        )
+
+        # GGUF's rope.dimension_count is the number of scalar Q/K dimensions rotated by
+        # ggml_rope_ext (the frequency table then has dimension_count / 2 entries), so this
+        # is a partial-rotary head width, not a pair count.
+        self.gguf_writer.add_rope_dimension_count(int(head_dim * float(full_rope["partial_rotary_factor"])))
+        self.gguf_writer.add_rope_dimension_count_swa(int(head_dim * float(swa_rope["partial_rotary_factor"])))
+        self.gguf_writer.add_rope_freq_base(float(full_rope["rope_theta"]))
+        self.gguf_writer.add_rope_freq_base_swa(float(swa_rope["rope_theta"]))
+
+        logger.info(f"gguf: sliding window = {hparams['sliding_window']}")
+        logger.info(f"gguf: rope dimension count = {int(head_dim * float(full_rope['partial_rotary_factor']))}, "
+                    f"swa = {int(head_dim * float(swa_rope['partial_rotary_factor']))}")
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.endswith(".self_attn.q_k_v_proj.weight"):
+            if bid is None:
+                raise ValueError(f"Spark2_5 fused QKV tensor has no block id: {name}")
+            n_head = int(self.hparams["num_attention_heads"])
+            n_head_kv = int(self.hparams.get("num_key_value_heads", n_head))
+            head_dim = int(self.hparams["head_dim"])
+            expected = (n_head + 2 * n_head_kv) * head_dim
+            if data_torch.shape[0] != expected:
+                raise ValueError(
+                    f"Spark2_5 layer {bid} fused QKV width {data_torch.shape[0]} != {expected}"
+                )
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_QKV, bid), data_torch
+            return
+
+        if name.endswith(".self_attn.g_proj.weight"):
+            if bid is None:
+                raise ValueError(f"Spark2_5 attention gate tensor has no block id: {name}")
+            expected = int(self.hparams["num_attention_heads"])
+            if data_torch.shape[0] != expected:
+                raise ValueError(
+                    f"Spark2_5 layer {bid} attention gate width {data_torch.shape[0]} != head count {expected}"
+                )
+
+        yield from super().modify_tensors(data_torch, name, bid)
 
 
 def parse_args() -> argparse.Namespace:

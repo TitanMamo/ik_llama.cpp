@@ -303,6 +303,7 @@ class MODEL_ARCH(IntEnum):
     LFM2         = auto()
     LFM2MOE      = auto()
     MAPLE        = auto()
+    SPARK2_5     = auto()
 
 
 class MODEL_TENSOR(IntEnum):
@@ -555,6 +556,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.LFM2:           "lfm2",
     MODEL_ARCH.LFM2MOE:        "lfm2moe",
     MODEL_ARCH.MAPLE:          "maple",
+    MODEL_ARCH.SPARK2_5:       "spark2_5",
 }
 
 TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
@@ -2029,6 +2031,19 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
+    ],
+    MODEL_ARCH.SPARK2_5: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
     ],
     # TODO
 }
