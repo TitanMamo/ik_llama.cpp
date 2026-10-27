@@ -334,8 +334,12 @@ def gate2(gg: GGUF, model_dir, tok_bin):
         return
     tok = hf_tokenizer(model_dir)
     chkhsh = hashlib.sha256(str(tok.encode(CHKTXT)).encode()).hexdigest()
-    report("G2 pre hash", "PASS" if chkhsh == PRE_HASH else "FAIL",
-           f"sha256(ids(check_text)) = {chkhsh[:16]}... (want {PRE_HASH[:16]}...)")
+    # the hash identifies the HF pre-tokenizer; it only says something about this file if the
+    # file claims that pre-tokenizer (otherwise G2 tok type has already failed)
+    ok_hash = chkhsh == PRE_HASH and pre == "spark2_5"
+    report("G2 pre hash", "PASS" if ok_hash else "FAIL",
+           f"sha256(ids(check_text)) = {chkhsh[:16]}..., file pre = {pre!r} "
+           f"(want {PRE_HASH[:16]}... + 'spark2_5')")
 
     hf_vocab = tok.get_vocab()
     inv = tok.convert_ids_to_tokens(list(range(N_TOKENS)))

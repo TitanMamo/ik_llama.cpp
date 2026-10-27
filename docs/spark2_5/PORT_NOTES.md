@@ -1,8 +1,9 @@
 # Spark2.5 (`spark2_5`) port checklist
 
 Executable companion: `qat_tools/tools/verify_spark2_5.py` — one command, PASS/FAIL per gate, works on
-any `spark2_5` GGUF (ours, Bl4ckyou's, a future one). Everything below is what that file checks, with
-the evidence an implementer can read in the three references.
+any `spark2_5` GGUF (ours, Bl4ckyou's, a future one). Public copy of both files:
+<https://github.com/TitanMamo/ik_llama.cpp/tree/spark-verify-kit/docs/spark2_5>. Everything below is
+what that file checks, with the evidence an implementer can read in the three references.
 
 Line numbers are pinned to:
 * **HF** `modeling_spark.py` / `configuration_spark.py` from `XHToken/Spark-X2.6-4B` (config
