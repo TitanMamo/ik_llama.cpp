@@ -32,11 +32,13 @@ The projection is one matmul whose output rows are exactly Q, then K, then V:
 * **HF** `modeling_spark.py:170-173` — the split: `q = qkv[..., :q_dim]`,
   `k = qkv[..., q_dim:q_dim+kv_dim]`, `v = qkv[..., q_dim+kv_dim:]`. Verbatim slicing, no reshape, no
   interleave.
-* **exllamav3** `spark2_5.py:181` — `key_fused_qkv = "q_k_v_proj"`, fed to the shared
-  `Attention` module, which splits by the same `[q | k | v]` convention.
+* **exllamav3** `spark2_5.py:181` — `key_fused_qkv = "q_k_v_proj"`; the shared `Attention` then fixes the
+  three ranges explicitly at `modules/attn.py:273-275`: q `(0, n_q*head_dim)`, k
+  `(q_dim, q_dim + n_kv*head_dim)`, v the remainder — the same `[Q;K;V]` order, not interleaved.
 * **ours** `src/llama-load-tensors.cpp:1805-1806` — `layer.wqkv` is created with
-  `{n_embd, n_embd_q + n_embd_k_i + n_embd_v_i}`; `src/graphs/build_spark2_5.cpp:33-42` runs
-  `build_std_attention`, whose `llm_build_mul_mat_qkv` splits that tensor with the same three offsets.
+  `{n_embd, n_embd_q + n_embd_k_i + n_embd_v_i}`; `src/graphs/build_spark2_5.cpp:39-42` runs
+  `build_std_attention`, and `src/llama-build-context.cpp:2648-2656` splits the fused matmul result at
+  exactly `0`, `q_dim`, `q_dim + kv_dim` — the same three offsets as HF.
 
 **Why an interleaved write is the classic failure.** Several fused-QKV layouts exist in the wild
 (`[Q;K;V]`, per-head `[q_h0 k_h0 v_h0 q_h1 ...]`, and Qwen-style `[q | gate]`); a converter that
@@ -162,8 +164,9 @@ entries), not a pair count; and `partial_rotary_factor` multiplies **`head_dim` 
   (G1 fails the file if one appears: a stray untied head is a different model).
 
 Related checkpoint naming: the embedding is `model.embedding.weight` (not `model.embed_tokens.weight`
-like every other Llama-shaped repo) — exllamav3 patches it at `spark2_5.py:94-100`, our converter maps
-it through `tensor_mapping.py:162`-style rules.
+like every other Llama-shaped repo) — exllamav3 patches it at `spark2_5.py:94-100`; ours is already
+covered by the pre-existing `"model.embedding"` mapping at `gguf-py/gguf/tensor_mapping.py:23`
+(the mamba-qbert entry), so the converter needed no change for it.
 
 ## 6. The things that are not "gates" but silently move logits
 
@@ -211,7 +214,8 @@ Each of these turns a silent numerical bug into a hard failure at conversion tim
 * **Anything about attention internals at run time** — the 512-vs-513 window, the gate's *position*
   relative to `out_proj`, the scale factor and the rope pairing are pinned only indirectly, by G5's
   24-token text parity against the torch reference. A port can pass G1-G4 and still attend over 513
-  keys; G5 catches it only if the divergence reaches the sampled text (it did for the encoder bug).
+  keys; in the encoder case that bug never crashed and never produced nonsense, it only cost quality
+  on long prompts. G5 is what would notice, and only if the drift reaches the sampled tokens.
 * **G5 needs a GPU and ~9 GB of VRAM/RAM** for the bf16 reference, and it is one prompt. It is a smoke
   test, not proof: two implementations that share a mistake agree with each other. The numeric
   authorities are G4 (bit-level, CPU) and PPL against the HF model.
