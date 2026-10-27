@@ -1776,7 +1776,9 @@ bool create_tensors_helper::create_spark2_5_tensors(const LLM_TN & tn) {
     model.tok_embd = create_embd(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), n_embd, n_vocab);
 
     model.output_norm = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
-    model.output      = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab},
+    // create_linear: the head is trellised too (head_bits 6 in the recipe), and a plain
+    // create_tensor rejects the I16 [16K, out/16, in/16] pack form on dims.
+    model.output      = create_linear(ctx_output, tn(LLM_TENSOR_OUTPUT,      "weight"), n_embd, n_vocab,
             llama_model_loader::TENSOR_NOT_REQUIRED);
     if (model.output == NULL) {
         // the head is tied to the token embedding
@@ -1801,14 +1803,26 @@ bool create_tensors_helper::create_spark2_5_tensors(const LLM_TN & tn) {
 
         layer.attn_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
 
-        // fused q|k|v projection
-        layer.wqkv = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_QKV, "weight", i),
-                {n_embd, n_embd_q + n_embd_k_i + n_embd_v_i});
+        // fused q|k|v projection. create_linear (not create_tensor): a K2 t16 pack stores
+        // this weight as I16 [16K, out/16, in/16] + .su/.sv and llm_load_k2 needs both; the
+        // f16 base path is the same tensor {in, out} either way.
+        // Our writer re-fuses exllamav3's split q_proj/k_proj/v_proj back into this one tensor,
+        // so a K2 pack normally has attn_qkv. NOT_REQUIRED + the split branch below keep packs
+        // that carry q/k/v instead (each with its own input scale) loadable as well.
+        layer.wqkv = create_linear(ctx_split, tn(LLM_TENSOR_ATTN_QKV, "weight", i),
+                n_embd, n_embd_q + n_embd_k_i + n_embd_v_i, llama_model_loader::TENSOR_NOT_REQUIRED);
+        if (layer.wqkv == nullptr) {
+            // split q/k/v: build_std_attention's llm_build_mul_mat_qkv already takes this path
+            // when wqkv is null, and the head-wise gate below is applied the same way.
+            layer.wq  = create_linear(ctx_split, tn(LLM_TENSOR_ATTN_Q, "weight", i), n_embd, n_embd_q);
+            layer.wk  = create_linear(ctx_split, tn(LLM_TENSOR_ATTN_K, "weight", i), n_embd, n_embd_k_i);
+            layer.wv  = create_linear(ctx_split, tn(LLM_TENSOR_ATTN_V, "weight", i), n_embd, n_embd_v_i);
+        }
 
         // head-wise attention output gate: one scalar per head
         layer.wqkv_gate = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_head_i});
 
-        layer.wo = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_q, n_embd});
+        layer.wo = create_linear(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), n_embd_q, n_embd);
 
         auto ffn_ctx = model.split_mode == LLAMA_SPLIT_MODE_GRAPH ? ctx_split : ctx_layer;
         layer.ffn_norm = create_tensor(ffn_ctx, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd});

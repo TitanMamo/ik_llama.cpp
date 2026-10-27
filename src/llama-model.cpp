@@ -598,7 +598,12 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
             { LLM_TENSOR_OUTPUT_NORM,        "output_norm" },
             { LLM_TENSOR_OUTPUT,             "output" },
             { LLM_TENSOR_ATTN_NORM,          "blk.%d.attn_norm" },
+            // the fused projection and its split q/k/v form: a K2 pack quantizes the fused HF
+            // q_k_v_proj as three matrices (one input scale each), a plain pack as one tensor
             { LLM_TENSOR_ATTN_QKV,           "blk.%d.attn_qkv" },
+            { LLM_TENSOR_ATTN_Q,             "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_K,             "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_V,             "blk.%d.attn_v" },
             { LLM_TENSOR_ATTN_GATE,          "blk.%d.attn_gate" },
             { LLM_TENSOR_ATTN_OUT,           "blk.%d.attn_output" },
             { LLM_TENSOR_FFN_NORM,           "blk.%d.ffn_norm" },
