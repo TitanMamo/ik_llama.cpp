@@ -115,6 +115,7 @@ add_library(llama
             graphs/build_gemma3.cpp
             graphs/build_gemma4.cpp
             graphs/build_dflash.cpp
+            graphs/build_lilicorr.cpp
             graphs/build_mamba.cpp
             graphs/build_command_r.cpp
             graphs/build_olmo.cpp
